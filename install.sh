@@ -409,8 +409,9 @@ uninstall() {
     check_root
     [[ ! -f "${INSTALL_DIR}/XrayR" ]] && { print_error "XrayR 未安装"; exit 1; }
     echo -e "${RED}${BOLD}即将完全卸载 XrayR!${NC}"
-    read -rp "确认? [y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 0
+    echo ""
+    read -rp "输入 yes 确认卸载: " confirm
+    [[ "$confirm" != "yes" ]] && { print_info "已取消"; exit 0; }
 
     systemctl stop ${SERVICE_NAME} 2>/dev/null || true
     systemctl disable ${SERVICE_NAME} 2>/dev/null || true
@@ -456,10 +457,18 @@ install() {
     check_root
 
     if [[ -f "${INSTALL_DIR}/XrayR" ]]; then
-        print_warn "XrayR 已安装"
-        read -rp "是否覆盖安装? [y/N]: " overwrite
-        [[ "$overwrite" != "y" && "$overwrite" != "Y" ]] && exit 0
-        systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+        print_warn "检测到 XrayR 已安装"
+        echo ""
+        echo -e "  ${GREEN}1)${NC} 覆盖安装 (保留配置)"
+        echo -e "  ${GREEN}2)${NC} 升级到最新版"
+        echo -e "  ${GREEN}0)${NC} 取消"
+        echo ""
+        read -rp "请选择 [0-2, 默认=1]: " install_choice
+        case "${install_choice}" in
+            0) print_info "已取消"; exit 0 ;;
+            2) upgrade; exit 0 ;;
+            *) systemctl stop ${SERVICE_NAME} 2>/dev/null || true ;;
+        esac
     fi
 
     local arch version
