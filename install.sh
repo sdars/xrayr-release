@@ -208,7 +208,7 @@ get_latest_version() {
 
 get_installed_version() {
     if [[ -x "${INSTALL_DIR}/XrayR" ]]; then
-        "${INSTALL_DIR}/XrayR" --version 2>/dev/null | head -1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1
+        "${INSTALL_DIR}/XrayR" version 2>/dev/null | head -1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1
     fi
     return 0
 }
