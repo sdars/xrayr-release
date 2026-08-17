@@ -334,17 +334,23 @@ Nodes:
         Email: ""
 CFGEOF
         print_ok "默认配置已生成"
-        # BufferSize 按内存自适应: <2GB=64, 2-4GB=128, >=4GB=512
+        # BufferSize 按内存自适应 (依据实测: 编译机 xray 26.3.27 压测)
+        #   吞吐: buf=16~512 无显著差异(1315~1698 MB/s, 波动即噪声); 仅 buf=4 掉到 1169
+        #         50ms/150ms 高延迟段 buf 4~512 完全一致(瓶颈在内核 TCP 窗口, 非 xray 缓冲)
+        #   内存: bufferSize 是"每连接上限"而非预分配。150 并发实测客户端峰值 RSS
+        #         buf=4 -> 54MB, buf=64 -> 51MB, buf=512 -> 54MB (服务端 72/73/80MB)
+        #   结论: 只要不低于 16 就不影响速度; 512 在中小并发下也无内存风险。
+        #         故小内存机取 64(留足余量), 其余取 512(极端高并发时上限更宽松)。
         local mem_mb
         mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
-        if [[ -n "$mem_mb" && "$mem_mb" -ge 4096 ]]; then
+        if [[ -n "$mem_mb" && "$mem_mb" -ge 2048 ]]; then
             sed -i 's/BufferSize: 64/BufferSize: 512/' "${CONFIG_DIR}/config.yml"
-            print_info "系统内存 ${mem_mb}MB >= 4GB, BufferSize 设为 512"
-        elif [[ -n "$mem_mb" && "$mem_mb" -ge 2048 ]]; then
+            print_info "系统内存 ${mem_mb}MB >= 2GB, BufferSize 设为 512 (实测无额外内存开销)"
+        elif [[ -n "$mem_mb" && "$mem_mb" -ge 1024 ]]; then
             sed -i 's/BufferSize: 64/BufferSize: 128/' "${CONFIG_DIR}/config.yml"
-            print_info "系统内存 ${mem_mb}MB >= 2GB, BufferSize 设为 128"
+            print_info "系统内存 ${mem_mb}MB >= 1GB, BufferSize 设为 128"
         else
-            print_info "系统内存 ${mem_mb:-未知}MB < 2GB, BufferSize 保持 64"
+            print_info "系统内存 ${mem_mb:-未知}MB < 1GB, BufferSize 保持 64 (仍高于影响吞吐的临界值 16)"
         fi
     else
         print_info "配置文件已存在, 保留"
