@@ -128,8 +128,16 @@ do_version() {
         inst_time="$(grep -E '^INSTALL_TIME=' "$vstate" 2>/dev/null | cut -d= -f2-)"
         inst_arch="$(grep -E '^INSTALL_ARCH=' "$vstate" 2>/dev/null | cut -d= -f2-)"
     fi
+    # 优先读二进制自报 (0.9.6+ 内置 Xray-core 行, 无需 binutils),
+    # 再退回 strings / grep -a 兼容旧版与精简系统。
+    if [[ -z "$core_ver" ]] || [[ "$core_ver" == "unknown" ]]; then
+        core_ver="$("${INSTALL_DIR}/XrayR" version 2>/dev/null | grep -iE '^Xray-core' | head -1 | grep -oE 'v?1\.[0-9]+\.[0-9]+' | head -1)"
+    fi
+    if [[ -z "$core_ver" ]] && command -v strings >/dev/null 2>&1; then
+        core_ver="$(strings "${INSTALL_DIR}/XrayR" 2>/dev/null | grep -oE '^v?1\.2[0-9]{5}\.[0-9]+$' | sort -Vu | tail -1)"
+    fi
     if [[ -z "$core_ver" ]]; then
-        core_ver="$(strings "${INSTALL_DIR}/XrayR" 2>/dev/null | grep -oE '^v?1\.2[0-9]{5}\.[0-9]+$' | sort -u | tail -1)"
+        core_ver="$(grep -aoE 'github\.com/xtls/xray-core@v1\.[0-9]{6}\.[0-9]+' "${INSTALL_DIR}/XrayR" 2>/dev/null | head -1 | sed 's/.*@//')"
     fi
     echo ""
     echo -e "  ${CYAN}${BOLD}────────────  版本信息  ────────────${NC}"
