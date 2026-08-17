@@ -62,6 +62,7 @@ _PROTO_LABELS = {
     "Shadowsocks": "Shadowsocks",
     "Trojan": "Trojan",
     "Shadowsocks-Plugin": "Shadowsocks-Plugin",
+    "Hysteria2": "Hysteria2",
 }
 
 def _norm_list(s):
@@ -303,11 +304,11 @@ def get_node_fields(idx):
     def _bool_raw(v):
         return 'true' if v else 'false'
     fields = [
-        ('PanelType',                          'API 配置', '面板类型',    panel, ['NewV2board','V2board','PMpanel','Proxypanel','V2RaySocks']),
+        ('PanelType',                          'API 配置', '面板类型',    panel, ['NewV2board','V2board','PMpanel','Proxypanel','V2RaySocks','SSpanel','GoV2Panel','BunPanel']),
         ('ApiConfig.ApiHost',                  'API 配置', '面板地址',    api.get('ApiHost',''), None),
         ('ApiConfig.ApiKey',                   'API 配置', 'API 密钥',   api.get('ApiKey',''), None),
         ('ApiConfig.NodeID',                   'API 配置', '节点 ID',    str(api.get('NodeID',0)), None),
-        ('ApiConfig.NodeType',                 'API 配置', '节点类型',    api.get('NodeType',''), ['V2ray','Vmess','Vless','Trojan','Shadowsocks','Shadowsocks-Plugin']),
+        ('ApiConfig.NodeType',                 'API 配置', '节点类型',    api.get('NodeType',''), ['V2ray','Vmess','Vless','Trojan','Shadowsocks','Shadowsocks-Plugin','Hysteria2']),
         ('ApiConfig.Timeout',                  'API 配置', '超时秒数',    str(api.get('Timeout',30)), None),
         ('ApiConfig.EnableVless',              'API 配置', '启用 VLESS',  _bool_raw(api.get('EnableVless')), ['true','false']),
         ('ApiConfig.SpeedLimit',               'API 配置', '限速(Mbps)',  str(api.get('SpeedLimit',0)), None),
@@ -1008,6 +1009,153 @@ def set_global(field, value):
 
 # ========== Link Import ==========
 
+# ========== 入站 Socket 调优 ==========
+
+_SOCKOPT_FIELDS = [
+    # (命令行参数名, 配置键名, 类型)
+    ('tcp_fast_open',      'TCPFastOpen',            'bool'),
+    ('queue_length',       'TCPFastOpenQueueLength', 'int'),
+    ('keepalive_idle',     'TCPKeepAliveIdle',       'int'),
+    ('keepalive_interval', 'TCPKeepAliveInterval',   'int'),
+    ('user_timeout',       'TCPUserTimeout',         'int'),
+    ('congestion',         'TCPCongestion',          'str'),
+    ('mptcp',              'TCPMptcp',               'bool'),
+    ('window_clamp',       'TCPWindowClamp',         'int'),
+    ('max_seg',            'TCPMaxSeg',              'int'),
+    ('bind_interface',     'Interface',              'str'),
+]
+
+
+def _parse_bool(v):
+    s = str(v).strip().lower()
+    if s in ('true', '1', 'yes', 'y', 'on', '是', '开', '开启'):
+        return True
+    if s in ('false', '0', 'no', 'n', 'off', '否', '关', '关闭'):
+        return False
+    raise ValueError(f'无法识别的布尔值: {v}')
+
+
+def _parse_sockopt_argv(argv):
+    """把 --tcp-fast-open true --queue-length 4096 这类参数解析成配置字典。"""
+    alias = {name.replace('_', '-'): (name, key, typ)
+             for name, key, typ in _SOCKOPT_FIELDS}
+    out = {}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith('--'):
+            i += 1
+            continue
+        flag = tok[2:]
+        if flag not in alias:
+            raise ValueError(f'未知参数: {tok}')
+        if i + 1 >= len(argv):
+            raise ValueError(f'{tok} 缺少取值')
+        raw = argv[i + 1]
+        _, key, typ = alias[flag]
+        if typ == 'bool':
+            out[key] = _parse_bool(raw)
+        elif typ == 'int':
+            out[key] = int(raw)
+        else:
+            out[key] = raw
+        i += 2
+    return out
+
+
+def sockopt_set(argv):
+    """为所有节点的 ControllerConfig 写入/更新 SocketConfig。"""
+    updates = _parse_sockopt_argv(argv)
+    if not updates:
+        print('ERROR: 未提供任何可设置项')
+        return
+
+    cfg = load_config()
+    if not cfg:
+        print('ERROR: No config')
+        return
+    nodes = cfg.get('Nodes') or []
+    if not nodes:
+        print('ERROR: 配置中没有任何节点')
+        return
+
+    for node in nodes:
+        cc = node.setdefault('ControllerConfig', {})
+        sc = cc.get('SocketConfig')
+        if not isinstance(sc, dict):
+            sc = {}
+        for k, v in updates.items():
+            # 取值为 0 / 空字符串视为「不设置」，直接移除该键，
+            # 避免把无意义的 0 写进配置造成误解。
+            if (isinstance(v, int) and not isinstance(v, bool) and v == 0) or v == '':
+                sc.pop(k, None)
+            else:
+                sc[k] = v
+        if sc:
+            cc['SocketConfig'] = sc
+        else:
+            cc.pop('SocketConfig', None)
+
+    save_config(cfg)
+    shown = ', '.join(f'{k}={v}' for k, v in updates.items())
+    print(f'OK: 已为 {len(nodes)} 个节点设置 SocketConfig ({shown})')
+
+
+def sockopt_remove():
+    """移除所有节点的 SocketConfig，回到 XrayR 默认行为。"""
+    cfg = load_config()
+    if not cfg:
+        print('ERROR: No config')
+        return
+    nodes = cfg.get('Nodes') or []
+    removed = 0
+    for node in nodes:
+        cc = node.get('ControllerConfig')
+        if isinstance(cc, dict) and cc.pop('SocketConfig', None) is not None:
+            removed += 1
+    save_config(cfg)
+    print(f'OK: 已从 {removed} 个节点移除 SocketConfig')
+
+
+def sockopt_show():
+    """以表格展示各节点当前的 SocketConfig。"""
+    cfg = load_config()
+    if not cfg:
+        print('ERROR: No config')
+        return
+    nodes = cfg.get('Nodes') or []
+    if not nodes:
+        print('（无节点）')
+        return
+    label = {
+        'TCPFastOpen': 'TCP Fast Open',
+        'TCPFastOpenQueueLength': 'TFO 队列长度',
+        'TCPKeepAliveIdle': 'keepalive 空闲(秒)',
+        'TCPKeepAliveInterval': 'keepalive 间隔(秒)',
+        'TCPUserTimeout': '未确认数据超时(毫秒)',
+        'TCPCongestion': '拥塞算法',
+        'TCPMptcp': 'Multipath TCP',
+        'TCPWindowClamp': '窗口上限(字节)',
+        'TCPMaxSeg': '最大段长(字节)',
+        'Interface': '绑定网卡',
+    }
+    for idx, node in enumerate(nodes, 1):
+        api = node.get('ApiConfig') or {}
+        cc = node.get('ControllerConfig') or {}
+        sc = cc.get('SocketConfig')
+        title = f"节点 {idx}  (ID={api.get('NodeID', '?')}, 类型={api.get('NodeType', '?')})"
+        print(title)
+        if not isinstance(sc, dict) or not sc:
+            print('  未配置 SocketConfig（保持默认行为）')
+            print('')
+            continue
+        for k, v in sc.items():
+            name = label.get(k, k)
+            if isinstance(v, bool):
+                v = '开启' if v else '关闭'
+            print(f'  {name}: {v}')
+        print('')
+
 import base64
 import re
 try:
@@ -1549,6 +1697,9 @@ def main():
         'export-links': lambda: export_links(),
         'show-global': lambda: show_global(),
         'set-global': lambda: set_global(args[0], args[1]),
+        'sockopt-set': lambda: sockopt_set(raw),
+        'sockopt-remove': lambda: sockopt_remove(),
+        'sockopt-show': lambda: sockopt_show(),
     }
 
     if cmd in commands:
