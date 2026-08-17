@@ -561,6 +561,7 @@ do_upgrade_to() {
     install_systemd_service
     install_log_limits
     register_command
+    install_self_copy
     write_version_state "$target"
 
     if [[ $was_running -eq 1 ]]; then
