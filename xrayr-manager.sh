@@ -9,6 +9,12 @@ CONFIG_DIR="/etc/XrayR"
 INSTALL_DIR="/usr/local/XrayR"
 HELPER="${INSTALL_DIR}/config_helper.py"
 
+# 更新检查相关 (与 install.sh 保持一致)
+REPO="sdars/xrayr-release"
+RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
+UPDATE_CACHE_FILE="/var/lib/.xrayr-update-cache"
+UPDATE_CACHE_TTL=3600
+
 # Colors
 RED=$'\e[0;31m'
 GREEN=$'\e[0;32m'
@@ -147,25 +153,37 @@ do_version() {
     printf "  %-16s %s\n" "安装脚本版本" "${script_ver:-未记录}"
     printf "  %-16s %s\n" "安装架构" "${inst_arch:-未知}"
     printf "  %-16s %s\n" "安装时间" "${inst_time:-未知}"
-    if [[ -f /etc/XrayR/.update-available ]]; then
-        local nv
-        nv="$(cat /etc/XrayR/.update-available 2>/dev/null)"
-        if [[ -n "$nv" ]]; then
-            echo ""
-            echo -e "  ${GREEN}${BOLD}▸ 发现新版本 ${nv}${NC}"
-            echo -e "  ${DIM}升级命令: xrayr-install upgrade${NC}"
-        fi
+    # 在线查询最新版本, 只有存在更新时才提示 (用户要求: 常态只显示本地)
+    local latest bv sv has_new=0
+    latest="$(_mgr_check_latest)"
+    bv="${latest%%|*}"; sv="${latest##*|}"
+    local norm_bin="${bin_ver#v}"
+    local norm_bv="${bv#v}"
+    if [[ -n "$bv" ]] && [[ -n "$norm_bin" ]] && _mgr_ver_lt "$norm_bin" "$norm_bv"; then
+        has_new=1
+        echo ""
+        echo -e "  ${GREEN}${BOLD}▸ 发现新版本 ${bv}${NC} ${DIM}(当前 ${bin_ver:-未知})${NC}"
+        echo -e "  ${DIM}升级命令: xrayr-install update ${bv}   或   xrayr update${NC}"
     fi
-    echo ""
-    echo -e "  ${DIM}更新管理: xrayr-install (菜单 [9] 更新管理)${NC}"
-    echo -e "  ${DIM}检测更新: xrayr-install check-update${NC}"
+    if [[ -n "$sv" ]] && [[ -n "$script_ver" ]] && _mgr_ver_lt "$script_ver" "$sv"; then
+        has_new=1
+        echo ""
+        echo -e "  ${GREEN}${BOLD}▸ 安装脚本有新版 ${sv}${NC} ${DIM}(当前 ${script_ver})${NC}"
+        echo -e "  ${DIM}更新命令: xrayr-install update self${NC}"
+    fi
+    # 缓存文件也可能有旧的提示, 一并同步清理
+    if [[ -f /etc/XrayR/.update-available ]] && [[ "$has_new" == "0" ]]; then
+        rm -f /etc/XrayR/.update-available 2>/dev/null
+    fi
     echo ""
     return 0
 }
 
 # 转到安装脚本的更新管理
+# 找不到本地 install.sh 时会自动从远端拉一份到 /usr/local/XrayR/install.sh
+# 并注册 xrayr-install 命令, 无需用户手动执行 curl。
 do_update_mgmt() {
-    local si="/usr/local/XrayR/install.sh"
+    local si="${INSTALL_DIR}/install.sh"
     if [[ -x /usr/local/bin/xrayr-install ]]; then
         /usr/local/bin/xrayr-install "$@"
         return $?
@@ -174,9 +192,67 @@ do_update_mgmt() {
         "$si" "$@"
         return $?
     fi
-    print_error "找不到安装脚本 (${si})"
-    print_info "可执行以下命令重新获取:"
-    echo -e "  ${CYAN}bash <(curl -sL https://raw.githubusercontent.com/sdars/xrayr-release/main/install.sh)${NC}"
+    # 自动补装: 首次通过 bash <(curl ...) 一次性安装时 install.sh 没落盘
+    print_info "本地未找到安装脚本, 正在从远端获取..."
+    mkdir -p "${INSTALL_DIR}"
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        print_error "系统缺少 curl/wget, 无法自动获取"
+        echo -e "  ${CYAN}bash <(curl -sL ${RAW_BASE}/install.sh)${NC}"
+        return 1
+    fi
+    local tmp="/tmp/xrayr-install-fetch.sh"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLo "$tmp" "${RAW_BASE}/install.sh" 2>/dev/null
+    else
+        wget -qO "$tmp" "${RAW_BASE}/install.sh" 2>/dev/null
+    fi
+    if [[ ! -s "$tmp" ]] || ! bash -n "$tmp" 2>/dev/null; then
+        print_error "远端脚本下载或校验失败"
+        rm -f "$tmp"
+        return 1
+    fi
+    install -m 755 "$tmp" "$si"
+    rm -f "$tmp"
+    ln -sf "$si" /usr/local/bin/xrayr-install
+    print_ok "安装脚本已落盘: ${si} (命令 xrayr-install 已注册)"
+    "$si" "$@"
+    return $?
+}
+
+# 查询远端最新版本 (带缓存, 与 install.sh 共用缓存文件)
+# 输出: <最新二进制版本>|<远端脚本版本>, 静默失败时返回空
+_mgr_check_latest() {
+    if [[ -f "$UPDATE_CACHE_FILE" ]]; then
+        local mtime now age
+        mtime="$(stat -c %Y "$UPDATE_CACHE_FILE" 2>/dev/null || echo 0)"
+        now="$(date +%s)"
+        age=$(( now - mtime ))
+        if [[ "$age" -lt "$UPDATE_CACHE_TTL" ]]; then
+            cat "$UPDATE_CACHE_FILE"
+            return 0
+        fi
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        return 1
+    fi
+    local bv sv
+    bv="$(curl -sL --max-time 8 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+    sv="$(curl -sL --max-time 8 "${RAW_BASE}/install.sh" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+    if [[ -n "$bv" ]] || [[ -n "$sv" ]]; then
+        mkdir -p "$(dirname "$UPDATE_CACHE_FILE")" 2>/dev/null
+        echo "${bv}|${sv}" > "$UPDATE_CACHE_FILE" 2>/dev/null
+    fi
+    echo "${bv}|${sv}"
+    return 0
+}
+
+# 比较版本 (a < b 返回 0)
+_mgr_ver_lt() {
+    local a="${1#v}" b="${2#v}"
+    if [[ "$a" == "$b" ]]; then return 1; fi
+    local lower
+    lower="$(printf '%s\n%s\n' "$a" "$b" | sort -V 2>/dev/null | head -1)"
+    if [[ "$lower" == "$a" ]]; then return 0; fi
     return 1
 }
 
