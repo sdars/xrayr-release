@@ -289,11 +289,11 @@ RouteConfigPath:
 InboundConfigPath:
 OutboundConfigPath:
 ConnectionConfig:
-  Handshake: 4
-  ConnIdle: 30
-  UplinkOnly: 2
-  DownlinkOnly: 4
-  BufferSize: 64
+  Handshake: 8
+  ConnIdle: 600
+  UplinkOnly: 4
+  DownlinkOnly: 30
+  BufferSize: 512
 Nodes:
   - PanelType: "NewV2board"
     ApiConfig:
@@ -440,10 +440,17 @@ Wants=network.target
 Type=simple
 User=root
 ExecStart=/usr/local/XrayR/XrayR --config /etc/XrayR/config.yml
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=3s
 LimitNOFILE=1048576
-LimitNPROC=512
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitMEMLOCK=infinity
+TasksMax=infinity
+OOMScoreAdjust=-500
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
 
 [Install]
 WantedBy=multi-user.target
@@ -451,6 +458,73 @@ SVCEOF
     systemctl daemon-reload
     systemctl enable ${SERVICE_NAME} >/dev/null 2>&1
     print_ok "systemd 服务已创建"
+    return 0
+}
+
+# ==================== 内核调优 ====================
+install_kernel_tuning() {
+    print_info "应用内核网络调优 (BBR + fq + 大缓冲 + keepalive + conntrack)..."
+    cat > /etc/sysctl.d/99-xrayr-perf.conf << 'SYSEOF'
+# XrayR 性能与稳定性调优
+# 拥塞控制
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+# 大缓冲 (长肥管道)
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+# 队列 / backlog
+net.core.netdev_max_backlog = 32768
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 32768
+net.ipv4.tcp_max_tw_buckets = 1440000
+# 保活 (需与 XrayR ConnIdle 匹配, 避免 NAT 中断)
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+# 端口范围
+net.ipv4.ip_local_port_range = 10000 65535
+# MTU 探测 / 中间盒鲁棒
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 131072
+# 快开 / 无延迟
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+# 连接跟踪 (若加载)
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+# 转发
+net.ipv4.ip_forward = 1
+SYSEOF
+    modprobe nf_conntrack 2>/dev/null
+    sysctl --system >/dev/null 2>&1
+
+    cat > /etc/security/limits.d/99-xrayr.conf << 'LIMEOF'
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc  unlimited
+* hard nproc  unlimited
+root soft nofile 1048576
+root hard nofile 1048576
+LIMEOF
+
+    local cc
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    if [[ "$cc" == "bbr" ]]; then
+        print_ok "内核调优已应用 (拥塞控制: bbr)"
+    else
+        print_warn "内核调优已写入, 但当前拥塞控制仍为: ${cc:-未知} (可能需重启或内核不支持 BBR)"
+    fi
     return 0
 }
 
@@ -854,6 +928,7 @@ do_install() {
     install_config_files
     install_geodata "$interactive"
     install_systemd_service
+    install_kernel_tuning
     install_log_limits
     install_geo_cron
     register_command
@@ -1119,26 +1194,28 @@ menu_tools() {
         done
         echo ""
         echo -e "   ${GREEN}1)${NC} 自动安装缺失依赖"
-        echo -e "   ${GREEN}2)${NC} 重新安装日志大小限制"
-        echo -e "   ${GREEN}3)${NC} 重新注册 xrayr 命令"
-        echo -e "   ${GREEN}4)${NC} 重新生成 systemd 服务"
-        echo -e "   ${GREEN}5)${NC} 补齐缺失配置文件"
-        echo -e "   ${GREEN}6)${NC} 查看磁盘 / 内存占用"
+        echo -e "   ${GREEN}2)${NC} 重新应用内核网络调优 (BBR/大缓冲/keepalive)"
+        echo -e "   ${GREEN}3)${NC} 重新安装日志大小限制"
+        echo -e "   ${GREEN}4)${NC} 重新注册 xrayr 命令"
+        echo -e "   ${GREEN}5)${NC} 重新生成 systemd 服务"
+        echo -e "   ${GREEN}6)${NC} 补齐缺失配置文件"
+        echo -e "   ${GREEN}7)${NC} 查看磁盘 / 内存占用"
         echo -e "   ${GREEN}0)${NC} 返回上级菜单"
         echo ""
         local c=""
-        if ! read -erp "   请选择 [0-6]: " c; then
+        if ! read -erp "   请选择 [0-7]: " c; then
             echo ""
             print_info "输入已结束, 返回"
             return 0
         fi
         case "$c" in
             1) install_dependencies; pause ;;
-            2) install_log_limits; pause ;;
-            3) register_command; pause ;;
-            4) install_systemd_service; pause ;;
-            5) install_config_files; print_ok "配置文件检查完成"; pause ;;
-            6)
+            2) install_kernel_tuning; pause ;;
+            3) install_log_limits; pause ;;
+            4) register_command; pause ;;
+            5) install_systemd_service; pause ;;
+            6) install_config_files; print_ok "配置文件检查完成"; pause ;;
+            7)
                 echo ""
                 df -h / 2>/dev/null | head -2
                 echo ""
@@ -1232,7 +1309,8 @@ show_help() {
     echo -e "  upgrade        升级到最新版本"
     echo -e "  uninstall      卸载"
     echo -e "  deps           仅检查并安装依赖"
-    echo -e "  log-limit      仅安装日志大小限制"
+    echo -e "  log-limit      仅安装日志大小限制
+  tune           仅应用内核网络调优 (BBR/大缓冲/keepalive)"
     echo -e "  geo            仅更新 GeoData"
     echo -e "  status         打印当前状态"
     echo -e "  help           显示本帮助"
@@ -1273,6 +1351,9 @@ main() {
             ;;
         log-limit|loglimit)
             install_log_limits
+            ;;
+        tune|tuning|sysctl)
+            install_kernel_tuning
             ;;
         geo|geodata)
             if [[ -x "${INSTALL_DIR}/geo-update.sh" ]]; then
