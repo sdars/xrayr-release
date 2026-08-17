@@ -119,7 +119,57 @@ do_disable() {
     print_ok "已关闭开机自启"
 }
 do_version() {
-    "${INSTALL_DIR}/XrayR" version 2>/dev/null || echo "未找到 XrayR"
+    local vstate="/etc/XrayR/.version"
+    local bin_ver core_ver script_ver inst_time inst_arch
+    bin_ver="$("${INSTALL_DIR}/XrayR" version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    if [[ -f "$vstate" ]]; then
+        core_ver="$(grep -E '^CORE_VERSION=' "$vstate" 2>/dev/null | cut -d= -f2-)"
+        script_ver="$(grep -E '^SCRIPT_VERSION=' "$vstate" 2>/dev/null | cut -d= -f2-)"
+        inst_time="$(grep -E '^INSTALL_TIME=' "$vstate" 2>/dev/null | cut -d= -f2-)"
+        inst_arch="$(grep -E '^INSTALL_ARCH=' "$vstate" 2>/dev/null | cut -d= -f2-)"
+    fi
+    if [[ -z "$core_ver" ]]; then
+        core_ver="$(strings "${INSTALL_DIR}/XrayR" 2>/dev/null | grep -oE '^v?1\.2[0-9]{5}\.[0-9]+$' | sort -u | tail -1)"
+    fi
+    echo ""
+    echo -e "  ${CYAN}${BOLD}────────────  版本信息  ────────────${NC}"
+    echo ""
+    printf "  %-16s %s\n" "XrayR 主程序" "${bin_ver:-未知}"
+    printf "  %-16s %s\n" "Xray 内核" "${core_ver:-未知}"
+    printf "  %-16s %s\n" "安装脚本版本" "${script_ver:-未记录}"
+    printf "  %-16s %s\n" "安装架构" "${inst_arch:-未知}"
+    printf "  %-16s %s\n" "安装时间" "${inst_time:-未知}"
+    if [[ -f /etc/XrayR/.update-available ]]; then
+        local nv
+        nv="$(cat /etc/XrayR/.update-available 2>/dev/null)"
+        if [[ -n "$nv" ]]; then
+            echo ""
+            echo -e "  ${GREEN}${BOLD}▸ 发现新版本 ${nv}${NC}"
+            echo -e "  ${DIM}升级命令: xrayr-install upgrade${NC}"
+        fi
+    fi
+    echo ""
+    echo -e "  ${DIM}更新管理: xrayr-install (菜单 [9] 更新管理)${NC}"
+    echo -e "  ${DIM}检测更新: xrayr-install check-update${NC}"
+    echo ""
+    return 0
+}
+
+# 转到安装脚本的更新管理
+do_update_mgmt() {
+    local si="/usr/local/XrayR/install.sh"
+    if [[ -x /usr/local/bin/xrayr-install ]]; then
+        /usr/local/bin/xrayr-install "$@"
+        return $?
+    fi
+    if [[ -x "$si" ]]; then
+        "$si" "$@"
+        return $?
+    fi
+    print_error "找不到安装脚本 (${si})"
+    print_info "可执行以下命令重新获取:"
+    echo -e "  ${CYAN}bash <(curl -sL https://raw.githubusercontent.com/sdars/xrayr-release/main/install.sh)${NC}"
+    return 1
 }
 
 
@@ -1552,6 +1602,13 @@ show_main_menu() {
     echo -e "  ${CYAN}${BOLD}╚══════════════════════════════════════╝${NC}"
     echo ""
     show_status
+    if [[ -f /etc/XrayR/.update-available ]]; then
+        local _nv
+        _nv="$(cat /etc/XrayR/.update-available 2>/dev/null)"
+        if [[ -n "$_nv" ]]; then
+            echo -e "  ${GREEN}${BOLD}▸ 发现新版本 ${_nv}${NC} ${DIM}(选 20 进入更新管理)${NC}"
+        fi
+    fi
     echo ""
     echo -e "  ${GREEN}${BOLD}─── 服务控制 ───${NC}"
     echo -e "  ${GREEN} 1)${NC} 启动        ${GREEN} 2)${NC} 停止        ${GREEN}3)${NC} 重启"
@@ -1566,7 +1623,7 @@ show_main_menu() {
     echo -e "  ${YELLOW}${BOLD}─── 系统维护 ───${NC}"
     echo -e "  ${YELLOW}14)${NC} GeoData 管理         ${YELLOW}15)${NC} 开启自启"
     echo -e "  ${YELLOW}16)${NC} 关闭自启             ${YELLOW}17)${NC} 查看版本"
-    echo -e "  ${YELLOW}19)${NC} 日志大小限制"
+    echo -e "  ${YELLOW}19)${NC} 日志大小限制         ${YELLOW}20)${NC} ${BOLD}更新管理${NC}"
     echo ""
     echo -e "  ${RED}${BOLD}─── 危险操作 ───${NC}"
     echo -e "  ${RED}18)${NC} 卸载 XrayR"
@@ -1578,7 +1635,7 @@ show_main_menu() {
 interactive_menu() {
     while true; do
         show_main_menu
-        read -erp "  请选择 [0-19]: " choice
+        read -erp "  请选择 [0-20]: " choice
         echo ""
         case "$choice" in
             1) do_start ;;
@@ -1600,6 +1657,7 @@ interactive_menu() {
             17) do_version ;;
             18) do_uninstall; exit 0 ;;
             19) menu_log_limit; continue ;;
+            20) do_update_mgmt update-menu ;;
             0) exit 0 ;;
             *) print_error "无效选项" ;;
         esac
@@ -1630,6 +1688,15 @@ cli_mode() {
         dns)         menu_dns ;;
         global)      menu_global ;;
         log-limit)   menu_log_limit ;;
+        update|upgrade)
+            shift
+            do_update_mgmt update "$@" ;;
+        check-update)
+            do_update_mgmt check-update ;;
+        self-update)
+            do_update_mgmt self-update ;;
+        update-menu)
+            do_update_mgmt update-menu ;;
         import-link|import)
             shift
             if [[ $# -eq 0 ]]; then
@@ -1672,6 +1739,14 @@ cli_mode() {
             echo "  disable      关闭自启"
             echo "  version      查看版本"
             echo "  log-limit    日志大小限制管理"
+            echo ""
+            echo "更新管理 (转发到 xrayr-install):"
+            echo "  update-menu       进入更新管理面板"
+            echo "  check-update      检测更新"
+            echo "  update            升级到最新版"
+            echo "  update <版本>     更新到指定版本, 例 update v0.9.5"
+            echo "  update list       列出可用版本"
+            echo "  self-update       更新安装脚本自身"
             echo "  uninstall    卸载 XrayR"
             echo ""
             echo "不带参数: 打开交互式管理面板"
