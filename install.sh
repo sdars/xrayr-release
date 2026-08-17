@@ -282,18 +282,18 @@ install_config_files() {
         cat > "${CONFIG_DIR}/config.yml" << 'CFGEOF'
 Log:
   Level: warning
-  AccessPath:
+  AccessPath: /dev/null
   ErrorPath:
-DnsConfigPath:
-RouteConfigPath:
+DnsConfigPath: /etc/XrayR/dns.json
+RouteConfigPath: /etc/XrayR/route.json
 InboundConfigPath:
-OutboundConfigPath:
+OutboundConfigPath: /etc/XrayR/custom_outbound.json
 ConnectionConfig:
   Handshake: 8
   ConnIdle: 600
-  UplinkOnly: 4
-  DownlinkOnly: 30
-  BufferSize: 512
+  UplinkOnly: 2
+  DownlinkOnly: 5
+  BufferSize: 64
 Nodes:
   - PanelType: "NewV2board"
     ApiConfig:
@@ -334,6 +334,18 @@ Nodes:
         Email: ""
 CFGEOF
         print_ok "默认配置已生成"
+        # BufferSize 按内存自适应: <2GB=64, 2-4GB=128, >=4GB=512
+        local mem_mb
+        mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+        if [[ -n "$mem_mb" && "$mem_mb" -ge 4096 ]]; then
+            sed -i 's/BufferSize: 64/BufferSize: 512/' "${CONFIG_DIR}/config.yml"
+            print_info "系统内存 ${mem_mb}MB >= 4GB, BufferSize 设为 512"
+        elif [[ -n "$mem_mb" && "$mem_mb" -ge 2048 ]]; then
+            sed -i 's/BufferSize: 64/BufferSize: 128/' "${CONFIG_DIR}/config.yml"
+            print_info "系统内存 ${mem_mb}MB >= 2GB, BufferSize 设为 128"
+        else
+            print_info "系统内存 ${mem_mb:-未知}MB < 2GB, BufferSize 保持 64"
+        fi
     else
         print_info "配置文件已存在, 保留"
     fi
