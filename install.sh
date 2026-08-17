@@ -26,7 +26,7 @@ COMMAND_LINK="/usr/local/bin/xrayr"
 
 # ==================== 版本与在线更新 ====================
 # 本安装脚本自身的版本号 (每次发布递增, 用于脚本自更新比对)
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 # 记录已安装的版本元数据 (二进制版本 / 脚本版本 / 安装时间 / 内嵌内核)
 VERSION_STATE_FILE="/etc/XrayR/.version"
 # 更新检查缓存 (避免频繁打 GitHub API), 单位秒
@@ -243,6 +243,19 @@ pad_disp() {
     return 0
 }
 
+# 从 raw 拉文件, 带 cache-buster + no-cache 头绕过 CDN 缓存
+# raw.githubusercontent 有约 5 分钟 CDN 缓存, 不绕过会导致刚推的版本检测不到
+raw_fetch() {
+    local file="$1" out="${2:-}"
+    local url="${RAW_BASE}/${file}?nocache=$(date +%s)"
+    if [[ -n "$out" ]]; then
+        curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --max-time 30 -o "$out" "$url" 2>/dev/null
+        return $?
+    fi
+    curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --max-time 15 "$url" 2>/dev/null
+    return $?
+}
+
 # ==================== 版本元数据 ====================
 # 写入 /etc/XrayR/.version, 记录本次安装的完整版本信息
 write_version_state() {
@@ -341,8 +354,7 @@ remote_version_exists() {
 
 # 获取远端安装脚本的 SCRIPT_VERSION
 get_remote_script_version() {
-    curl -sL --max-time 15 "${RAW_BASE}/install.sh" 2>/dev/null \
-        | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2
+    raw_fetch install.sh | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2
     return 0
 }
 
@@ -611,7 +623,7 @@ do_self_update() {
 
     local tmp="/tmp/xrayr-install-new.sh"
     print_info "下载新版安装脚本..."
-    if ! curl -fsSLo "$tmp" "${RAW_BASE}/install.sh" 2>/dev/null; then
+    if ! raw_fetch install.sh "$tmp"; then
         print_error "下载失败"
         return 1
     fi
@@ -820,7 +832,7 @@ install_self_copy() {
     if [[ -f "$self" ]] && [[ -s "$self" ]] && grep -q '^SCRIPT_VERSION=' "$self" 2>/dev/null; then
         install -m 755 "$self" "${INSTALL_DIR}/install.sh" 2>/dev/null
     else
-        curl -fsSLo "${INSTALL_DIR}/install.sh" "${RAW_BASE}/install.sh" 2>/dev/null
+        raw_fetch install.sh "${INSTALL_DIR}/install.sh"
         chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null
     fi
     if [[ -s "${INSTALL_DIR}/install.sh" ]]; then
