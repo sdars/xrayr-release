@@ -354,6 +354,7 @@ ROUTEEOF
         cat > "${CONFIG_DIR}/dns.json" << 'DNSEOF'
 {
   "servers": ["1.1.1.1", "8.8.8.8", "localhost"],
+  "queryStrategy": "UseIPv4",
   "tag": "dns_inbound"
 }
 DNSEOF
@@ -639,6 +640,32 @@ tune_show_current() {
     if [[ "$cc" == "bbr" ]] && [[ "$qd" == "fq" ]] && [[ "${rmax:-0}" -ge 16777216 ]]; then
         print_ok "本机看起来已完成过网络调优, 可直接跳过"
     fi
+
+    # 异常低值主动检测 (母机模板常埋的坑, 会导致代理"用一会就断流")
+    local tw pr syn abnormal=0
+    tw="$(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null)"
+    syn="$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null)"
+    pr="$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null | tr '\t' ' ')"
+    if [[ -n "$tw" && "$tw" -lt 32768 ]]; then
+        print_warn "tcp_max_tw_buckets=${tw} 偏低 (代理机建议 >=262144): TIME_WAIT 易爆满, 表现为'刚连正常, 过一会断流'"
+        abnormal=1
+    fi
+    if [[ -n "$syn" && "$syn" -lt 1024 ]]; then
+        print_warn "tcp_max_syn_backlog=${syn} 偏低 (建议 >=8192): 突发连接易被丢弃"
+        abnormal=1
+    fi
+    if [[ -n "$pr" ]]; then
+        local plo phi span
+        plo="${pr%% *}"; phi="${pr##* }"
+        span=$(( phi - plo ))
+        if [[ "$span" -lt 20000 ]]; then
+            print_warn "ip_local_port_range=${pr} 可用端口仅 ${span} 个 (建议 >=40000): 高负载下易端口耗尽"
+            abnormal=1
+        fi
+    fi
+    if [[ "$abnormal" == "1" ]]; then
+        print_warn "以上为异常低值, 多由 VPS 母机模板预置, 而非本机优化结果; 建议执行 [safe] 或 [full] 调优修正"
+    fi
     return 0
 }
 
@@ -662,6 +689,10 @@ net.ipv4.tcp_wmem = 4096 65536 16777216
 net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 32768
 net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_max_tw_buckets = 262144
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
