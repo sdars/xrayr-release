@@ -9,6 +9,9 @@ CONFIG_DIR="/etc/XrayR"
 INSTALL_DIR="/usr/local/XrayR"
 HELPER="${INSTALL_DIR}/config_helper.py"
 
+# 管理脚本自身版本 (启动时按此比对远端, 有更新则静默升级)
+MGR_VERSION="1.1.0"
+
 # 更新检查相关 (与 install.sh 保持一致)
 REPO="sdars/xrayr-release"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
@@ -26,6 +29,87 @@ pad_disp() {
     pad=$(( want - w ))
     if [[ "$pad" -lt 0 ]]; then pad=0; fi
     printf '%s%*s' "$str" "$pad" ""
+}
+
+# 每次启动静默自升级 (缓存 1 小时避免频繁网络请求)
+# 检查两个脚本: xrayr-manager.sh (需 exec 重启才能生效) 和 install.sh (直接替换)
+# 短路: XRAYR_MGR_SELF_UPDATED=1 表示本次 exec 链里已升级过, 避免死循环
+_mgr_silent_selfupdate() {
+    if [[ -n "$XRAYR_MGR_SELF_UPDATED" ]]; then
+        return 0
+    fi
+    local cache="/var/lib/.xrayr-mgr-selfupd"
+    local age=0 now mtime
+    if [[ -f "$cache" ]]; then
+        mtime="$(stat -c %Y "$cache" 2>/dev/null || echo 0)"
+        now="$(date +%s)"
+        age=$(( now - mtime ))
+        if [[ "$age" -lt 3600 ]]; then
+            return 0
+        fi
+    fi
+    command -v curl >/dev/null 2>&1 || return 0
+
+    # 静默拉取远端两个脚本的版本行 (只读一行, 快且省流量)
+    local remote_mgr remote_ins
+    remote_mgr="$(curl -sL --max-time 6 "${RAW_BASE}/xrayr-manager.sh" 2>/dev/null | grep -m1 '^MGR_VERSION=' | cut -d'"' -f2)"
+    remote_ins="$(curl -sL --max-time 6 "${RAW_BASE}/install.sh"       2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+
+    # 无论有无新版都写缓存, 避免同一时段反复重试
+    mkdir -p "$(dirname "$cache")" "${INSTALL_DIR}" 2>/dev/null
+    date +%s > "$cache" 2>/dev/null
+
+    local updated_mgr=0 updated_ins=0 old_mgr="$MGR_VERSION" old_ins=""
+
+    # 1) install.sh 静默升级 (不需要 exec, 下次调用时才用到新版)
+    if [[ -n "$remote_ins" ]]; then
+        old_ins="$(grep -m1 '^SCRIPT_VERSION=' "${INSTALL_DIR}/install.sh" 2>/dev/null | cut -d'"' -f2)"
+        if [[ -z "$old_ins" ]] || _mgr_ver_lt "$old_ins" "$remote_ins"; then
+            local tmp1="/tmp/.xrayr-install-selfupd.sh"
+            if curl -fsSLo "$tmp1" "${RAW_BASE}/install.sh" 2>/dev/null                 && bash -n "$tmp1" 2>/dev/null                 && grep -q 'do_install()' "$tmp1"; then
+                install -m 755 "$tmp1" "${INSTALL_DIR}/install.sh"
+                ln -sf "${INSTALL_DIR}/install.sh" /usr/local/bin/xrayr-install
+                if [[ -f /etc/XrayR/.version ]]; then
+                    sed -i "s/^SCRIPT_VERSION=.*/SCRIPT_VERSION=${remote_ins}/" /etc/XrayR/.version 2>/dev/null
+                fi
+                updated_ins=1
+            fi
+            rm -f "$tmp1"
+        fi
+    fi
+
+    # 2) xrayr-manager.sh 静默升级 (需要 exec 重启当前进程, 否则本次跑的仍是旧代码)
+    if [[ -n "$remote_mgr" ]] && _mgr_ver_lt "$MGR_VERSION" "$remote_mgr"; then
+        local tmp2="/tmp/.xrayr-manager-selfupd.sh"
+        if curl -fsSLo "$tmp2" "${RAW_BASE}/xrayr-manager.sh" 2>/dev/null             && bash -n "$tmp2" 2>/dev/null             && grep -q 'interactive_menu()' "$tmp2"             && grep -q '^MGR_VERSION=' "$tmp2"; then
+            install -m 755 "$tmp2" "${INSTALL_DIR}/xrayr-manager.sh"
+            cp -f "${INSTALL_DIR}/xrayr-manager.sh" /usr/local/bin/xrayr
+            chmod +x /usr/local/bin/xrayr
+            updated_mgr=1
+        fi
+        rm -f "$tmp2"
+    fi
+
+    # 一行简明提示 (若两者都没更新则完全静默)
+    if [[ $updated_mgr -eq 1 ]] || [[ $updated_ins -eq 1 ]]; then
+        local msg="  ${GREEN}✓${NC} ${DIM}已静默升级脚本${NC}"
+        if [[ $updated_mgr -eq 1 ]]; then
+            msg="${msg} ${DIM}manager ${old_mgr}→${remote_mgr}${NC}"
+        fi
+        if [[ $updated_ins -eq 1 ]]; then
+            msg="${msg} ${DIM}installer ${old_ins:-未记录}→${remote_ins}${NC}"
+        fi
+        echo -e "$msg"
+    fi
+
+    # manager 自身升级了, exec 重启, 让本次会话跑新代码
+    if [[ $updated_mgr -eq 1 ]]; then
+        export XRAYR_MGR_SELF_UPDATED=1
+        if [[ -x /usr/local/bin/xrayr ]]; then
+            exec /usr/local/bin/xrayr "$@"
+        fi
+    fi
+    return 0
 }
 
 # Colors
@@ -164,6 +248,7 @@ do_version() {
     echo "  $(pad_disp 'XrayR 主程序' 16) ${bin_ver:-未知}"
     echo "  $(pad_disp 'Xray 内核' 16) ${core_ver:-未知}"
     echo "  $(pad_disp '安装脚本版本' 16) ${script_ver:-未记录}"
+    echo "  $(pad_disp '管理脚本版本' 16) ${MGR_VERSION}"
     echo "  $(pad_disp '安装架构' 16) ${inst_arch:-未知}"
     echo "  $(pad_disp '安装时间' 16) ${inst_time:-未知}"
     # 在线查询最新版本, 只有存在更新时才提示 (用户要求: 常态只显示本地)
@@ -183,6 +268,14 @@ do_version() {
         echo ""
         echo -e "  ${GREEN}${BOLD}▸ 安装脚本有新版 ${sv}${NC} ${DIM}(当前 ${script_ver})${NC}"
         echo -e "  ${DIM}更新命令: xrayr-install update self${NC}"
+    fi
+    # 管理脚本自身版本比对 (启动时会静默自升级, 这里只作显示)
+    local remote_mgr
+    remote_mgr="$(curl -sL --max-time 4 "${RAW_BASE}/xrayr-manager.sh" 2>/dev/null | grep -m1 '^MGR_VERSION=' | cut -d'"' -f2)"
+    if [[ -n "$remote_mgr" ]] && _mgr_ver_lt "$MGR_VERSION" "$remote_mgr"; then
+        has_new=1
+        echo ""
+        echo -e "  ${GREEN}${BOLD}▸ 管理脚本有新版 ${remote_mgr}${NC} ${DIM}(当前 ${MGR_VERSION}, 下次启动自动升级)${NC}"
     fi
     # 缓存文件也可能有旧的提示, 一并同步清理
     if [[ -f /etc/XrayR/.update-available ]] && [[ "$has_new" == "0" ]]; then
@@ -1856,6 +1949,10 @@ cli_mode() {
 }
 
 # ========== 入口 ==========
+# 每次启动时静默检查/升级脚本自身与 install.sh (缓存 1 小时)
+# 参数会通过 exec 透传, 用户无感知
+_mgr_silent_selfupdate "$@"
+
 if [[ $# -eq 0 ]]; then
     interactive_menu
 else
