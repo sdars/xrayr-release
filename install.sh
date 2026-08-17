@@ -24,6 +24,18 @@ SERVICE_NAME="XrayR"
 SERVICE_FILE="/etc/systemd/system/XrayR.service"
 COMMAND_LINK="/usr/local/bin/xrayr"
 
+# ==================== 版本与在线更新 ====================
+# 本安装脚本自身的版本号 (每次发布递增, 用于脚本自更新比对)
+SCRIPT_VERSION="1.1.0"
+# 记录已安装的版本元数据 (二进制版本 / 脚本版本 / 安装时间 / 内嵌内核)
+VERSION_STATE_FILE="/etc/XrayR/.version"
+# 更新检查缓存 (避免频繁打 GitHub API), 单位秒
+UPDATE_CACHE_FILE="/var/lib/.xrayr-update-cache"
+UPDATE_CACHE_TTL=3600
+# 自动检查更新开关配置
+UPDATE_CONF_FILE="/etc/XrayR/update.conf"
+RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
+
 DEFAULT_GEOIP_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
 DEFAULT_GEOSITE_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
 ALT_GEOIP_URL="https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
@@ -211,6 +223,783 @@ get_installed_version() {
         "${INSTALL_DIR}/XrayR" version 2>/dev/null | head -1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1
     fi
     return 0
+}
+
+# 按"显示宽度"补齐字符串, 用于中文表格对齐。
+# printf %-Ns 按字节计数, 中文在 UTF-8 下占 3 字节但只显示 2 列, 直接用会错位。
+# 显示宽度 = 字符数 + 全角字符数; UTF-8 中文 3 字节 1 字符, 故 (bytes-chars)/2 即全角数。
+pad_disp() {
+    local str="$1" want="${2:-10}"
+    local bytes chars wide w pad
+    bytes="$(printf '%s' "$str" | wc -c)"
+    chars="$(printf '%s' "$str" | wc -m)"
+    wide=$(( (bytes - chars) / 2 ))
+    w=$(( chars + wide ))
+    pad=$(( want - w ))
+    if [[ "$pad" -lt 0 ]]; then
+        pad=0
+    fi
+    printf '%s%*s' "$str" "$pad" ""
+    return 0
+}
+
+# ==================== 版本元数据 ====================
+# 写入 /etc/XrayR/.version, 记录本次安装的完整版本信息
+write_version_state() {
+    local bin_ver="$1" script_ver="${2:-$SCRIPT_VERSION}"
+    mkdir -p "$CONFIG_DIR"
+    local core_ver
+    core_ver="$(get_core_version)"
+    cat > "$VERSION_STATE_FILE" <<VSEOF
+BINARY_VERSION=${bin_ver}
+SCRIPT_VERSION=${script_ver}
+CORE_VERSION=${core_ver:-unknown}
+INSTALL_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+INSTALL_ARCH=$(get_arch)
+VSEOF
+    return 0
+}
+
+read_version_state() {
+    local key="$1"
+    if [[ -f "$VERSION_STATE_FILE" ]]; then
+        grep -E "^${key}=" "$VERSION_STATE_FILE" 2>/dev/null | head -1 | cut -d= -f2-
+    fi
+    return 0
+}
+
+# 从二进制里提取内嵌的 Xray 内核版本
+get_core_version() {
+    if [[ ! -x "${INSTALL_DIR}/XrayR" ]]; then
+        return 0
+    fi
+    local v
+    v="$("${INSTALL_DIR}/XrayR" version 2>/dev/null | grep -oE 'Xray-core v?[0-9.]+' | head -1 | grep -oE '[0-9][0-9.]*')"
+    if [[ -z "$v" ]]; then
+        v="$(strings "${INSTALL_DIR}/XrayR" 2>/dev/null | grep -oE '^v?1\.2[0-9]{5}\.[0-9]+$' | sort -u | tail -1)"
+    fi
+    echo "$v"
+    return 0
+}
+
+# 当前正在运行的安装脚本自身版本 (已安装副本)
+get_installed_script_version() {
+    local sv
+    sv="$(read_version_state SCRIPT_VERSION)"
+    if [[ -z "$sv" ]] && [[ -f "${INSTALL_DIR}/install.sh" ]]; then
+        sv="$(grep -m1 '^SCRIPT_VERSION=' "${INSTALL_DIR}/install.sh" 2>/dev/null | cut -d'"' -f2)"
+    fi
+    echo "$sv"
+    return 0
+}
+
+# ==================== 在线更新检查 ====================
+# 版本号比较: 返回 0 表示 $1 < $2 (即有新版本)
+version_lt() {
+    local a="${1#v}" b="${2#v}"
+    if [[ "$a" == "$b" ]]; then
+        return 1
+    fi
+    local lower
+    lower="$(printf '%s\n%s\n' "$a" "$b" | sort -V 2>/dev/null | head -1)"
+    if [[ "$lower" == "$a" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# 列出发布仓库所有可用版本 (新→旧)
+list_remote_versions() {
+    curl -sL --max-time 20 "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
+        | grep '"tag_name"' | cut -d'"' -f4
+    return 0
+}
+
+# 校验某个版本在远端是否存在对应架构的二进制
+remote_version_exists() {
+    local ver="$1" arch="${2:-$(get_arch)}"
+    local code
+    code="$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 \
+        "https://github.com/${REPO}/releases/download/${ver}/XrayR-linux-${arch}" 2>/dev/null)"
+    if [[ "$code" == "200" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# 获取远端安装脚本的 SCRIPT_VERSION
+get_remote_script_version() {
+    curl -sL --max-time 15 "${RAW_BASE}/install.sh" 2>/dev/null \
+        | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2
+    return 0
+}
+
+# 带缓存的更新检查, 输出: <最新二进制版本>|<远端脚本版本>
+check_updates_cached() {
+    local force="${1:-0}"
+    if [[ "$force" != "1" ]] && [[ -f "$UPDATE_CACHE_FILE" ]]; then
+        local mtime now age
+        mtime="$(stat -c %Y "$UPDATE_CACHE_FILE" 2>/dev/null || echo 0)"
+        now="$(date +%s)"
+        age=$(( now - mtime ))
+        if [[ "$age" -lt "$UPDATE_CACHE_TTL" ]]; then
+            cat "$UPDATE_CACHE_FILE"
+            return 0
+        fi
+    fi
+    local bv sv
+    bv="$(get_latest_version)"
+    sv="$(get_remote_script_version)"
+    mkdir -p "$(dirname "$UPDATE_CACHE_FILE")" 2>/dev/null
+    echo "${bv}|${sv}" > "$UPDATE_CACHE_FILE" 2>/dev/null
+    echo "${bv}|${sv}"
+    return 0
+}
+
+# 打印更新检查结果 (中文表格)
+do_check_update() {
+    local force="${1:-1}"
+    echo ""
+    echo -e "${CYAN}${BOLD}  ──────────────  检测更新  ──────────────${NC}"
+    echo ""
+    print_info "正在查询远端版本..."
+    local res bv sv
+    res="$(check_updates_cached "$force")"
+    bv="${res%%|*}"
+    sv="${res##*|}"
+
+    local cur_bin cur_script cur_core
+    cur_bin="$(get_installed_version)"
+    cur_script="$(get_installed_script_version)"
+    cur_core="$(read_version_state CORE_VERSION)"
+    if [[ -z "$cur_core" ]]; then
+        cur_core="$(get_core_version)"
+    fi
+
+    echo ""
+    echo -e "  $(pad_disp '项目' 18)$(pad_disp '当前版本' 20)$(pad_disp '最新版本' 20)状态"
+    echo -e "  ${DIM}────────────────────────────────────────────────────────────────${NC}"
+
+    local bin_state="已是最新"
+    if [[ -z "$cur_bin" ]]; then
+        bin_state="${YELLOW}未安装${NC}"
+    elif [[ -z "$bv" ]]; then
+        bin_state="${RED}查询失败${NC}"
+    elif version_lt "$cur_bin" "$bv"; then
+        bin_state="${GREEN}可更新${NC}"
+    else
+        bin_state="${DIM}已是最新${NC}"
+    fi
+    echo -e "  $(pad_disp 'XrayR 主程序' 18)$(pad_disp "${cur_bin:-未安装}" 20)$(pad_disp "${bv:-查询失败}" 20)${bin_state}"
+
+    local scr_state
+    if [[ -z "$sv" ]]; then
+        scr_state="${RED}查询失败${NC}"
+    elif [[ -z "$cur_script" ]]; then
+        scr_state="${YELLOW}未记录${NC}"
+    elif version_lt "$cur_script" "$sv"; then
+        scr_state="${GREEN}可更新${NC}"
+    else
+        scr_state="${DIM}已是最新${NC}"
+    fi
+    echo -e "  $(pad_disp '安装脚本' 18)$(pad_disp "${cur_script:-未记录}" 20)$(pad_disp "${sv:-查询失败}" 20)${scr_state}"
+
+    echo -e "  $(pad_disp '内嵌 Xray 内核' 18)$(pad_disp "${cur_core:-未知}" 20)$(pad_disp '-' 20)${DIM}随主程序更新${NC}"
+    echo ""
+
+    local has_update=0
+    if [[ -n "$cur_bin" ]] && [[ -n "$bv" ]] && version_lt "$cur_bin" "$bv"; then
+        has_update=1
+        echo -e "  ${GREEN}▸${NC} 主程序有新版本 ${GREEN}${bv}${NC}, 可用菜单 [2] 或 ${CYAN}xrayr-install upgrade${NC} 升级"
+    fi
+    if [[ -n "$cur_script" ]] && [[ -n "$sv" ]] && version_lt "$cur_script" "$sv"; then
+        has_update=1
+        echo -e "  ${GREEN}▸${NC} 安装脚本有新版本 ${GREEN}${sv}${NC}, 可用菜单 [10] 更新脚本自身"
+    fi
+    if [[ "$has_update" == "0" ]]; then
+        echo -e "  ${DIM}当前已是最新, 无需更新${NC}"
+    fi
+    echo ""
+    return 0
+}
+
+# ==================== 更新到指定版本 ====================
+# 交互式选择版本, 或直接指定
+do_upgrade_to() {
+    check_root
+    local target="${1:-}"
+    if ! is_installed; then
+        print_error "XrayR 未安装, 请先执行安装"
+        return 1
+    fi
+    install_dependencies
+
+    local arch cur
+    arch="$(get_arch)"
+    cur="$(get_installed_version)"
+
+    if [[ -z "$target" ]]; then
+        echo ""
+        print_info "正在获取可用版本列表..."
+        local vers
+        vers="$(list_remote_versions)"
+        if [[ -z "$vers" ]]; then
+            print_error "无法获取版本列表 (网络问题?)"
+            return 1
+        fi
+        echo ""
+        echo -e "  ${BOLD}可用版本${NC} (当前: ${YELLOW}${cur:-未知}${NC})"
+        echo -e "  ${DIM}──────────────────────────────────────${NC}"
+        local i=0 v
+        local -a vlist=()
+        while IFS= read -r v; do
+            [[ -z "$v" ]] && continue
+            i=$(( i + 1 ))
+            vlist+=("$v")
+            local mark=""
+            if [[ "$v" == "$cur" ]]; then
+                mark=" ${CYAN}← 当前${NC}"
+            fi
+            if [[ "$i" == "1" ]]; then
+                mark="${mark} ${GREEN}(最新)${NC}"
+            fi
+            echo -e "  ${GREEN}${i})${NC} ${v}${mark}"
+            if [[ "$i" -ge 20 ]]; then
+                break
+            fi
+        done <<< "$vers"
+        echo -e "  ${GREEN}0)${NC} 取消"
+        echo ""
+        echo -e "  ${DIM}提示: 也可直接输入版本号, 如 v0.9.5${NC}"
+        local sel=""
+        read -erp "  请选择版本序号或直接输入版本号: " sel
+        if [[ -z "$sel" ]] || [[ "$sel" == "0" ]]; then
+            print_info "已取消"
+            return 0
+        fi
+        if [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -le "${#vlist[@]}" ]]; then
+            target="${vlist[$(( sel - 1 ))]}"
+        else
+            target="$sel"
+        fi
+    fi
+
+    # 归一化: 允许用户输入不带 v 前缀
+    if [[ ! "$target" =~ ^v ]] && [[ "$target" =~ ^[0-9] ]]; then
+        target="v${target}"
+    fi
+
+    echo ""
+    print_info "校验目标版本 ${target} 是否存在 (${arch})..."
+    if ! remote_version_exists "$target" "$arch"; then
+        print_error "远端不存在版本 ${target} 的 ${arch} 二进制"
+        print_info "可用版本: $(list_remote_versions | head -5 | tr '\n' ' ')"
+        return 1
+    fi
+    print_ok "目标版本可用"
+
+    echo ""
+    echo -e "   当前版本: ${YELLOW}${cur:-未知}${NC}   →   目标版本: ${GREEN}${target}${NC}"
+    if [[ -n "$cur" ]] && version_lt "$target" "$cur"; then
+        print_warn "这是一次${BOLD}降级${NC}操作"
+    fi
+    if [[ -t 0 ]]; then
+        local ok=""
+        read -erp "  确认继续? [y/N]: " ok
+        if [[ ! "$ok" =~ ^[Yy]$ ]]; then
+            print_info "已取消"
+            return 0
+        fi
+    fi
+
+    # 备份当前二进制, 失败可回滚
+    local bak="${INSTALL_DIR}/XrayR.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -f "${INSTALL_DIR}/XrayR" "$bak" 2>/dev/null
+    print_info "已备份原二进制: ${bak}"
+
+    local was_running=0
+    if [[ "$(svc_state)" == "running" ]]; then
+        was_running=1
+    fi
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+
+    if ! download_binary "$target" "$arch"; then
+        print_error "下载失败, 回滚到原版本"
+        cp -f "$bak" "${INSTALL_DIR}/XrayR" 2>/dev/null
+        chmod +x "${INSTALL_DIR}/XrayR"
+        if [[ $was_running -eq 1 ]]; then
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+        fi
+        return 1
+    fi
+
+    # 启动自检: 新二进制能否正常执行
+    if ! "${INSTALL_DIR}/XrayR" version >/dev/null 2>&1; then
+        print_error "新二进制无法执行, 自动回滚"
+        cp -f "$bak" "${INSTALL_DIR}/XrayR" 2>/dev/null
+        chmod +x "${INSTALL_DIR}/XrayR"
+        if [[ $was_running -eq 1 ]]; then
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+        fi
+        return 1
+    fi
+
+    download_manager_scripts "$target"
+    install_systemd_service
+    install_log_limits
+    register_command
+    write_version_state "$target"
+
+    if [[ $was_running -eq 1 ]]; then
+        systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+        sleep 2
+        if [[ "$(svc_state)" != "running" ]]; then
+            print_error "服务启动失败! 正在回滚到 ${cur}"
+            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+            cp -f "$bak" "${INSTALL_DIR}/XrayR" 2>/dev/null
+            chmod +x "${INSTALL_DIR}/XrayR"
+            write_version_state "${cur}"
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+            print_warn "已回滚, 请检查日志: journalctl -u XrayR -n 50"
+            return 1
+        fi
+    fi
+
+    echo ""
+    print_ok "已更新到 ${target}"
+    local nc
+    nc="$(get_core_version)"
+    if [[ -n "$nc" ]]; then
+        echo -e "   内嵌 Xray 内核: ${GREEN}${nc}${NC}"
+    fi
+    # 仅保留最近 3 个备份
+    ls -1t "${INSTALL_DIR}"/XrayR.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f
+    return 0
+}
+
+# ==================== 脚本自更新 ====================
+do_self_update() {
+    check_root
+    echo ""
+    echo -e "${CYAN}${BOLD}  ──────────  更新安装脚本自身  ──────────${NC}"
+    echo ""
+    local remote_sv
+    remote_sv="$(get_remote_script_version)"
+    if [[ -z "$remote_sv" ]]; then
+        print_error "无法获取远端脚本版本 (网络问题?)"
+        return 1
+    fi
+    echo -e "   本地脚本版本: ${YELLOW}${SCRIPT_VERSION}${NC}   远端版本: ${GREEN}${remote_sv}${NC}"
+    if ! version_lt "$SCRIPT_VERSION" "$remote_sv"; then
+        print_ok "安装脚本已是最新"
+        return 0
+    fi
+
+    local tmp="/tmp/xrayr-install-new.sh"
+    print_info "下载新版安装脚本..."
+    if ! curl -fsSLo "$tmp" "${RAW_BASE}/install.sh" 2>/dev/null; then
+        print_error "下载失败"
+        return 1
+    fi
+    # 完整性自检: 必须是合法 bash 且含关键函数
+    if ! bash -n "$tmp" 2>/dev/null; then
+        print_error "下载的脚本语法校验失败, 已丢弃"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! grep -q 'do_install()' "$tmp" || ! grep -q '^SCRIPT_VERSION=' "$tmp"; then
+        print_error "下载的脚本内容异常, 已丢弃"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    local self_bak="${INSTALL_DIR}/install.sh.bak-$(date +%Y%m%d-%H%M%S)"
+    if [[ -f "${INSTALL_DIR}/install.sh" ]]; then
+        cp -f "${INSTALL_DIR}/install.sh" "$self_bak"
+    fi
+    install -m 755 "$tmp" "${INSTALL_DIR}/install.sh"
+    rm -f "$tmp"
+    # 同步注册 xrayr-install 命令
+    ln -sf "${INSTALL_DIR}/install.sh" /usr/local/bin/xrayr-install
+    # 更新版本记录里的脚本版本
+    if [[ -f "$VERSION_STATE_FILE" ]]; then
+        sed -i "s/^SCRIPT_VERSION=.*/SCRIPT_VERSION=${remote_sv}/" "$VERSION_STATE_FILE"
+    fi
+    rm -f "$UPDATE_CACHE_FILE"
+
+    print_ok "安装脚本已更新到 ${remote_sv}"
+    echo -e "   安装位置: ${CYAN}${INSTALL_DIR}/install.sh${NC}"
+    echo -e "   调用命令: ${GREEN}xrayr-install${NC}"
+    echo -e "   ${YELLOW}提示: 请重新运行 xrayr-install 以使用新版脚本${NC}"
+    return 0
+}
+
+# ==================== 自动检查更新 (定时) ====================
+read_update_conf() {
+    local key="$1" def="$2"
+    if [[ -f "$UPDATE_CONF_FILE" ]]; then
+        local v
+        v="$(grep -E "^${key}=" "$UPDATE_CONF_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
+        if [[ -n "$v" ]]; then
+            echo "$v"
+            return 0
+        fi
+    fi
+    echo "$def"
+    return 0
+}
+
+write_update_conf() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$UPDATE_CONF_FILE" <<UCEOF
+# XrayR 自动更新检查配置
+# AUTO_CHECK: 是否启用每日自动检查更新 (true/false)
+AUTO_CHECK=${1:-true}
+# AUTO_APPLY: 检测到新版本后是否自动升级 (true/false, 默认仅提醒不自动升级)
+AUTO_APPLY=${2:-false}
+# CHECK_SCHEDULE: 检查时间 (cron 格式)
+CHECK_SCHEDULE=${3:-25 5 * * *}
+UCEOF
+    return 0
+}
+
+install_update_checker() {
+    local auto_check="${1:-true}" auto_apply="${2:-false}"
+    local sched
+    sched="$(read_update_conf CHECK_SCHEDULE '25 5 * * *')"
+    write_update_conf "$auto_check" "$auto_apply" "$sched"
+
+    cat > "${INSTALL_DIR}/update-check.sh" <<'UPEOF'
+#!/bin/bash
+# XrayR 自动更新检查 (由 systemd timer 或 cron 调用)
+REPO="sdars/xrayr-release"
+INSTALL_DIR="/usr/local/XrayR"
+CONFIG_DIR="/etc/XrayR"
+CONF="/etc/XrayR/update.conf"
+LOG="/var/log/xrayr-update-check.log"
+STATE="/etc/XrayR/.version"
+NOTIFY="/etc/XrayR/.update-available"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+
+conf_get() {
+    local k="$1" d="$2" v=""
+    if [[ -f "$CONF" ]]; then
+        v="$(grep -E "^${k}=" "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)"
+    fi
+    if [[ -n "$v" ]]; then echo "$v"; else echo "$d"; fi
+}
+
+AUTO_CHECK="$(conf_get AUTO_CHECK true)"
+AUTO_APPLY="$(conf_get AUTO_APPLY false)"
+if [[ "$AUTO_CHECK" != "true" ]]; then
+    exit 0
+fi
+
+cur="$("${INSTALL_DIR}/XrayR" version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+latest="$(curl -sL --max-time 20 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+
+if [[ -z "$latest" ]]; then
+    log "查询远端版本失败"
+    exit 0
+fi
+
+norm() { echo "${1#v}"; }
+if [[ "$(norm "$cur")" == "$(norm "$latest")" ]]; then
+    log "已是最新 (${cur})"
+    rm -f "$NOTIFY"
+    exit 0
+fi
+lower="$(printf '%s\n%s\n' "$(norm "$cur")" "$(norm "$latest")" | sort -V | head -1)"
+if [[ "$lower" != "$(norm "$cur")" ]]; then
+    log "本地版本 ${cur} 高于远端 ${latest}, 跳过"
+    exit 0
+fi
+
+log "发现新版本: ${cur} -> ${latest}"
+echo "${latest}" > "$NOTIFY"
+
+if [[ "$AUTO_APPLY" == "true" ]]; then
+    log "AUTO_APPLY=true, 开始自动升级"
+    if [[ -x "${INSTALL_DIR}/install.sh" ]]; then
+        yes y | "${INSTALL_DIR}/install.sh" upgrade >> "$LOG" 2>&1
+        rc=$?
+        log "自动升级结束, 退出码=${rc}"
+        if [[ $rc -eq 0 ]]; then rm -f "$NOTIFY"; fi
+    else
+        log "找不到 ${INSTALL_DIR}/install.sh, 无法自动升级"
+    fi
+else
+    log "仅提醒模式 (AUTO_APPLY=false), 运行 xrayr-install 查看"
+fi
+UPEOF
+    chmod +x "${INSTALL_DIR}/update-check.sh"
+
+    # 优先 systemd timer, 回退 cron
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > /etc/systemd/system/xrayr-update-check.service <<'USEOF'
+[Unit]
+Description=XrayR Update Check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/XrayR/update-check.sh
+USEOF
+        local hh mm
+        mm="$(echo "$sched" | awk '{print $1}')"
+        hh="$(echo "$sched" | awk '{print $2}')"
+        cat > /etc/systemd/system/xrayr-update-check.timer <<UTEOF
+[Unit]
+Description=XrayR Update Check Timer
+
+[Timer]
+OnCalendar=*-*-* ${hh:-5}:${mm:-25}:00
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UTEOF
+        systemctl daemon-reload >/dev/null 2>&1
+        if [[ "$auto_check" == "true" ]]; then
+            systemctl enable --now xrayr-update-check.timer >/dev/null 2>&1
+            print_ok "自动更新检查已启用 (systemd timer, 每日 ${hh:-5}:${mm:-25})"
+        else
+            systemctl disable --now xrayr-update-check.timer >/dev/null 2>&1
+            print_info "自动更新检查已关闭"
+        fi
+    elif command -v crontab >/dev/null 2>&1; then
+        if [[ "$auto_check" == "true" ]]; then
+            (crontab -l 2>/dev/null | grep -v "update-check.sh"; \
+             echo "${sched} ${INSTALL_DIR}/update-check.sh >/dev/null 2>&1") | crontab -
+            print_ok "自动更新检查已启用 (cron: ${sched})"
+        else
+            crontab -l 2>/dev/null | grep -v "update-check.sh" | crontab - >/dev/null 2>&1
+            print_info "自动更新检查已关闭"
+        fi
+    else
+        print_warn "系统既无 systemd 也无 crontab, 自动检查未安装"
+    fi
+    return 0
+}
+
+# 启动面板时的静默更新提示
+show_update_notice() {
+    if [[ -f /etc/XrayR/.update-available ]]; then
+        local nv
+        nv="$(cat /etc/XrayR/.update-available 2>/dev/null)"
+        if [[ -n "$nv" ]]; then
+            echo -e "  ${GREEN}${BOLD}▸ 发现新版本 ${nv}${NC} ${DIM}(菜单 [2] 升级, [9] 查看详情)${NC}"
+        fi
+    fi
+    return 0
+}
+
+# 把当前正在运行的安装脚本落盘到 INSTALL_DIR 并注册 xrayr-install 命令
+# 这样后续无需再 curl 远端即可进入面板, 也让脚本自更新有明确目标路径
+install_self_copy() {
+    mkdir -p "$INSTALL_DIR"
+    local self="${BASH_SOURCE[0]}"
+    # 通过 bash <(curl ...) 运行时 BASH_SOURCE 是 /dev/fd/63 之类, 需回落到远端拉取
+    if [[ -f "$self" ]] && [[ -s "$self" ]] && grep -q '^SCRIPT_VERSION=' "$self" 2>/dev/null; then
+        install -m 755 "$self" "${INSTALL_DIR}/install.sh" 2>/dev/null
+    else
+        curl -fsSLo "${INSTALL_DIR}/install.sh" "${RAW_BASE}/install.sh" 2>/dev/null
+        chmod +x "${INSTALL_DIR}/install.sh" 2>/dev/null
+    fi
+    if [[ -s "${INSTALL_DIR}/install.sh" ]]; then
+        ln -sf "${INSTALL_DIR}/install.sh" /usr/local/bin/xrayr-install
+        print_ok "命令 ${GREEN}xrayr-install${NC} 已注册 (安装/更新管理)"
+    else
+        print_warn "安装脚本自身落盘失败, xrayr-install 命令不可用"
+    fi
+    return 0
+}
+
+# 安装时询问是否启用自动更新检查
+prompt_update_checker() {
+    local interactive="${1:-1}"
+    if [[ "$interactive" != "1" ]] || [[ ! -t 0 ]]; then
+        # 非交互: 默认启用"每日检查 + 仅提醒"
+        install_update_checker true false
+        return 0
+    fi
+    echo ""
+    echo -e "${CYAN}${BOLD}  ──────────  自动更新检查  ──────────${NC}"
+    echo -e "   ${GREEN}1)${NC} 每日检查并${BOLD}仅提醒${NC}   ${DIM}(推荐, 不会自动改动服务)${NC}"
+    echo -e "   ${GREEN}2)${NC} 每日检查并${BOLD}自动升级${NC} ${DIM}(会自动重启服务, 有短暂断流)${NC}"
+    echo -e "   ${GREEN}3)${NC} 不启用自动检查"
+    echo ""
+    local c=""
+    read -erp "   请选择 [1-3, 默认=1]: " c
+    case "$c" in
+        2) install_update_checker true true ;;
+        3) install_update_checker false false ;;
+        *) install_update_checker true false ;;
+    esac
+    return 0
+}
+
+# ==================== 更新管理菜单 ====================
+menu_update() {
+    while true
+    do
+        clear
+        echo ""
+        echo -e "${CYAN}${BOLD}  ══════════  更新管理  ══════════${NC}"
+        echo ""
+        local cur_bin cur_script cur_core
+        cur_bin="$(get_installed_version)"
+        cur_script="$(get_installed_script_version)"
+        cur_core="$(read_version_state CORE_VERSION)"
+        if [[ -z "$cur_core" ]]; then
+            cur_core="$(get_core_version)"
+        fi
+        echo -e "   主程序版本   : ${GREEN}${cur_bin:-未安装}${NC}"
+        echo -e "   安装脚本版本 : ${GREEN}${cur_script:-${SCRIPT_VERSION}}${NC}"
+        echo -e "   Xray 内核    : ${GREEN}${cur_core:-未知}${NC}"
+        local ac aa
+        ac="$(read_update_conf AUTO_CHECK true)"
+        aa="$(read_update_conf AUTO_APPLY false)"
+        local ac_txt="${RED}已关闭${NC}" aa_txt="${DIM}仅提醒${NC}"
+        if [[ "$ac" == "true" ]]; then
+            ac_txt="${GREEN}已开启${NC}"
+        fi
+        if [[ "$aa" == "true" ]]; then
+            aa_txt="${YELLOW}自动升级${NC}"
+        fi
+        echo -e "   自动检查     : ${ac_txt}   处理方式: ${aa_txt}"
+        echo ""
+        echo -e "  ${CYAN}──────────────────────────────────────────${NC}"
+        echo -e "   ${GREEN}1)${NC} 立即检测更新 (主程序 + 脚本)"
+        echo -e "   ${GREEN}2)${NC} 升级主程序到最新版"
+        echo -e "   ${GREEN}3)${NC} 更新到${BOLD}指定版本${NC} (可升级/降级)"
+        echo -e "   ${GREEN}4)${NC} 更新安装脚本自身"
+        echo -e "   ${GREEN}5)${NC} 更新管理面板脚本 (xrayr 命令)"
+        echo -e "   ${GREEN}6)${NC} 开启/关闭 每日自动检查"
+        echo -e "   ${GREEN}7)${NC} 切换 检测到新版是否自动升级"
+        echo -e "   ${GREEN}8)${NC} 修改自动检查时间"
+        echo -e "   ${GREEN}9)${NC} 查看更新检查日志"
+        echo -e "   ${GREEN}10)${NC} 回滚到上一个备份版本"
+        echo -e "   ${GREEN}0)${NC} 返回"
+        echo -e "  ${CYAN}──────────────────────────────────────────${NC}"
+        echo ""
+        local c=""
+        if ! read -erp "   请选择 [0-10]: " c; then
+            return 0
+        fi
+        case "$c" in
+            1) do_check_update 1; pause ;;
+            2) do_upgrade; pause ;;
+            3) do_upgrade_to; pause ;;
+            4) do_self_update; pause ;;
+            5)
+                local v
+                v="$(get_installed_version)"
+                if [[ -z "$v" ]]; then
+                    v="$(get_latest_version)"
+                fi
+                download_manager_scripts "${v:-v0.9.5}"
+                register_command
+                pause ;;
+            6)
+                local nac="true"
+                if [[ "$ac" == "true" ]]; then
+                    nac="false"
+                fi
+                install_update_checker "$nac" "$aa"
+                pause ;;
+            7)
+                local naa="true"
+                if [[ "$aa" == "true" ]]; then
+                    naa="false"
+                fi
+                if [[ "$naa" == "true" ]]; then
+                    print_warn "开启后将在检测到新版本时${BOLD}自动升级${NC}并重启服务"
+                    local ok=""
+                    read -erp "   确认开启? [y/N]: " ok
+                    if [[ ! "$ok" =~ ^[Yy]$ ]]; then
+                        print_info "已取消"
+                        pause
+                        continue
+                    fi
+                fi
+                install_update_checker "$ac" "$naa"
+                pause ;;
+            8)
+                echo ""
+                echo -e "  ${DIM}当前: $(read_update_conf CHECK_SCHEDULE '25 5 * * *')${NC}"
+                echo -e "  ${DIM}格式: 分 时 日 月 周, 例 '25 5 * * *' 表示每天 05:25${NC}"
+                local ns=""
+                read -erp "   新的检查时间: " ns
+                if [[ -n "$ns" ]]; then
+                    write_update_conf "$ac" "$aa" "$ns"
+                    install_update_checker "$ac" "$aa"
+                else
+                    print_info "未修改"
+                fi
+                pause ;;
+            9)
+                echo ""
+                if [[ -f /var/log/xrayr-update-check.log ]]; then
+                    tail -40 /var/log/xrayr-update-check.log
+                else
+                    print_info "暂无更新检查日志"
+                fi
+                pause ;;
+            10)
+                echo ""
+                local -a baks=()
+                local b
+                while IFS= read -r b; do
+                    [[ -n "$b" ]] && baks+=("$b")
+                done < <(ls -1t "${INSTALL_DIR}"/XrayR.bak-* 2>/dev/null)
+                if [[ "${#baks[@]}" -eq 0 ]]; then
+                    print_warn "没有可用的二进制备份"
+                    pause
+                    continue
+                fi
+                echo -e "  ${BOLD}可用备份${NC}"
+                local i=0
+                for b in "${baks[@]}"; do
+                    i=$(( i + 1 ))
+                    local bv
+                    bv="$("$b" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+                    echo -e "  ${GREEN}${i})${NC} $(basename "$b")  ${DIM}版本 ${bv:-未知}${NC}"
+                done
+                echo -e "  ${GREEN}0)${NC} 取消"
+                local sel=""
+                read -erp "   选择要回滚的备份: " sel
+                if [[ -z "$sel" ]] || [[ "$sel" == "0" ]]; then
+                    print_info "已取消"
+                    pause
+                    continue
+                fi
+                if [[ ! "$sel" =~ ^[0-9]+$ ]] || [[ "$sel" -gt "${#baks[@]}" ]]; then
+                    print_error "无效选择"
+                    pause
+                    continue
+                fi
+                local src="${baks[$(( sel - 1 ))]}"
+                local was=0
+                if [[ "$(svc_state)" == "running" ]]; then
+                    was=1
+                fi
+                systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+                cp -f "$src" "${INSTALL_DIR}/XrayR"
+                chmod +x "${INSTALL_DIR}/XrayR"
+                write_version_state "$("${INSTALL_DIR}/XrayR" version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+                if [[ $was -eq 1 ]]; then
+                    systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+                fi
+                print_ok "已回滚到 $(basename "$src")"
+                pause ;;
+            0|q) return 0 ;;
+            *) print_warn "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
 # ==================== 下载 ====================
@@ -1190,6 +1979,14 @@ show_status_block() {
             ver="未知"
         fi
         echo -e "   安装状态   ${GREEN}已安装${NC}    程序版本  ${GREEN}${ver}${NC}"
+        local _core
+        _core="$(read_version_state CORE_VERSION)"
+        if [[ -z "$_core" ]]; then
+            _core="$(get_core_version)"
+        fi
+        if [[ -n "$_core" ]]; then
+            echo -e "   Xray 内核  ${CYAN}${_core}${NC}"
+        fi
     else
         echo -e "   安装状态   ${YELLOW}未安装${NC}"
     fi
@@ -1218,7 +2015,21 @@ show_status_block() {
             echo -e "   管理命令   ${YELLOW}未注册${NC}"
         fi
         echo -e "   配置目录   ${CYAN}${CONFIG_DIR}${NC}"
+        local _ac
+        _ac="$(read_update_conf AUTO_CHECK true)"
+        if [[ "$_ac" == "true" ]]; then
+            local _aa
+            _aa="$(read_update_conf AUTO_APPLY false)"
+            if [[ "$_aa" == "true" ]]; then
+                echo -e "   自动更新   ${GREEN}每日检查 + 自动升级${NC}"
+            else
+                echo -e "   自动更新   ${GREEN}每日检查${NC} ${DIM}(仅提醒)${NC}"
+            fi
+        else
+            echo -e "   自动更新   ${YELLOW}未启用${NC}"
+        fi
     fi
+    show_update_notice
     echo ""
     return 0
 }
@@ -1288,12 +2099,23 @@ do_install() {
     install_log_limits
     install_geo_cron
     register_command
+    install_self_copy
+    write_version_state "$version"
+    prompt_update_checker "$interactive"
 
     echo ""
     echo -e "${GREEN}${BOLD}  ══════════  XrayR ${version} 安装完成  ══════════${NC}"
     echo ""
     echo -e "   管理面板命令 : ${GREEN}${BOLD}xrayr${NC}"
+    echo -e "   安装管理命令 : ${GREEN}${BOLD}xrayr-install${NC} ${DIM}(更新/降级/卸载)${NC}"
     echo -e "   主配置文件   : ${CYAN}${CONFIG_DIR}/config.yml${NC}"
+    local _ic
+    _ic="$(get_core_version)"
+    if [[ -n "$_ic" ]]; then
+        echo -e "   Xray 内核    : ${CYAN}${_ic}${NC}"
+    fi
+    echo -e "   检测更新     : ${CYAN}xrayr-install check-update${NC}"
+    echo -e "   指定版本     : ${CYAN}xrayr-install update <版本号>${NC}"
     echo -e "   下一步       : ${YELLOW}运行 xrayr 进入面板配置对接信息, 再启动服务${NC}"
     echo ""
     RESET_CONFIG=0
@@ -1340,11 +2162,19 @@ do_upgrade() {
     install_systemd_service
     install_log_limits
     register_command
+    install_self_copy
+    write_version_state "$version"
+    rm -f /etc/XrayR/.update-available "$UPDATE_CACHE_FILE"
 
     if [[ $was_running -eq 1 ]]; then
         systemctl start "$SERVICE_NAME" >/dev/null 2>&1
     fi
     print_ok "已升级到 ${version}"
+    local _nc
+    _nc="$(get_core_version)"
+    if [[ -n "$_nc" ]]; then
+        echo -e "   内嵌 Xray 内核: ${GREEN}${_nc}${NC}"
+    fi
     return 0
 }
 
@@ -1374,6 +2204,9 @@ do_uninstall() {
     systemctl stop xrayr-geo-update.timer >/dev/null 2>&1
     systemctl disable xrayr-geo-update.timer >/dev/null 2>&1
     rm -f /etc/systemd/system/xrayr-geo-update.timer /etc/systemd/system/xrayr-geo-update.service
+    systemctl stop xrayr-update-check.timer >/dev/null 2>&1
+    systemctl disable xrayr-update-check.timer >/dev/null 2>&1
+    rm -f /etc/systemd/system/xrayr-update-check.timer /etc/systemd/system/xrayr-update-check.service
     systemctl daemon-reload >/dev/null 2>&1
     print_ok "服务已注销"
 
@@ -1383,16 +2216,19 @@ do_uninstall() {
 
     print_info "注销 xrayr 命令..."
     rm -f "$COMMAND_LINK" /usr/bin/xrayr
+    rm -f /usr/local/bin/xrayr-install /usr/bin/xrayr-install
     hash -r 2>/dev/null
     print_ok "命令已注销"
 
     print_info "清理定时任务与日志规则..."
     if command -v crontab >/dev/null 2>&1; then
-        crontab -l 2>/dev/null | grep -v "geo-update" | crontab - >/dev/null 2>&1
+        crontab -l 2>/dev/null | grep -v "geo-update" | grep -v "update-check.sh" | crontab - >/dev/null 2>&1
     fi
     rm -f /etc/logrotate.d/xrayr
     rm -f /etc/systemd/journald.conf.d/xrayr-limits.conf
     rm -f /var/log/xrayr-geo-update.log
+    rm -f /var/log/xrayr-update-check.log
+    rm -f "$UPDATE_CACHE_FILE" /etc/XrayR/.update-available
     systemctl restart systemd-journald >/dev/null 2>&1
     print_ok "定时任务与日志规则已清理"
 
@@ -1619,11 +2455,12 @@ main_menu() {
         echo -e "   ${GREEN}3)${NC} 卸载 XrayR               ${GREEN}4)${NC} 服务控制 (启停/日志)"
         echo -e "   ${GREEN}5)${NC} 打开 XrayR 管理面板      ${GREEN}6)${NC} GeoData 数据管理"
         echo -e "   ${GREEN}7)${NC} 系统工具与依赖维护       ${GREEN}8)${NC} 查看版本信息"
+        echo -e "   ${GREEN}9)${NC} ${BOLD}更新管理 (检测/指定版本/自动更新)${NC}"
         echo -e "   ${GREEN}0)${NC} 退出"
         echo -e "${CYAN}  ──────────────────────────────────────────────────${NC}"
         echo ""
         local c=""
-        if ! read -erp "   请输入选项 [0-8]: " c; then
+        if ! read -erp "   请输入选项 [0-9]: " c; then
             echo ""
             print_info "输入已结束, 退出"
             return 0
@@ -1636,9 +2473,12 @@ main_menu() {
             5) open_manager ;;
             6) menu_geodata ;;
             7) menu_tools ;;
+            9) menu_update ;;
             8)
                 echo ""
                 echo -e "   已安装版本 : ${GREEN}$(get_installed_version)${NC}"
+                echo -e "   安装脚本版 : ${GREEN}$(get_installed_script_version)${NC} ${DIM}(本次运行: ${SCRIPT_VERSION})${NC}"
+                echo -e "   Xray 内核  : ${GREEN}$(get_core_version)${NC}"
                 echo -e "   仓库最新版 : ${GREEN}$(get_latest_version)${NC}"
                 echo -e "   发布仓库   : ${CYAN}${REPO}${NC}"
                 echo -e "   系统架构   : ${CYAN}$(get_arch)${NC}"
@@ -1663,6 +2503,17 @@ show_help() {
     echo -e "  install        交互式安装"
     echo -e "  auto-install   非交互安装 (使用默认 Geo 数据源)"
     echo -e "  upgrade        升级到最新版本"
+    echo -e "  upgrade <版本> 更新到指定版本 (可升级/降级)"
+    echo -e "  update         同 upgrade"
+    echo -e "  update <版本>  更新到指定版本, 例 update v0.9.5"
+    echo -e "  update check   仅检测更新, 不做改动"
+    echo -e "  update list    列出发布仓库所有可用版本"
+    echo -e "  update self    更新安装脚本自身"
+    echo -e "  update scripts 更新管理面板脚本 (xrayr 命令)"
+    echo -e "  update auto on|off    开关每日自动检查更新"
+    echo -e "  update apply on|off   开关检测到新版后自动升级"
+    echo -e "  check-update   检测更新 (同 update check)"
+    echo -e "  self-update    更新安装脚本自身 (同 update self)"
     echo -e "  uninstall      卸载"
     echo -e "  deps           仅检查并安装依赖"
     echo -e "  log-limit      仅安装日志大小限制
@@ -1700,8 +2551,82 @@ main() {
         auto-install|--auto|auto)
             do_install 0
             ;;
-        upgrade|update)
-            do_upgrade
+        upgrade)
+            # upgrade            -> 升级到最新
+            # upgrade v0.9.5     -> 升级/降级到指定版本
+            if [[ -n "${2:-}" ]]; then
+                do_upgrade_to "$2"
+            else
+                do_upgrade
+            fi
+            ;;
+        update)
+            # update             -> 等同 upgrade
+            # update <版本>      -> 指定版本
+            # update check       -> 仅检测更新
+            # update list        -> 列出可用版本
+            # update self        -> 更新安装脚本自身
+            # update scripts     -> 更新管理面板脚本
+            # update auto on|off -> 开关每日自动检查
+            # update apply on|off-> 开关自动升级
+            case "${2:-}" in
+                ""|latest)   do_upgrade ;;
+                check)       do_check_update 1 ;;
+                list|versions)
+                    echo ""
+                    echo -e "  ${BOLD}发布仓库可用版本${NC} (${CYAN}${REPO}${NC})"
+                    local cv
+                    cv="$(get_installed_version)"
+                    local v
+                    while IFS= read -r v; do
+                        [[ -z "$v" ]] && continue
+                        if [[ "$v" == "$cv" ]]; then
+                            echo -e "   ${GREEN}${v}${NC} ${CYAN}← 当前${NC}"
+                        else
+                            echo -e "   ${v}"
+                        fi
+                    done < <(list_remote_versions)
+                    echo "" ;;
+                self|script)  do_self_update ;;
+                scripts|manager)
+                    local mv
+                    mv="$(get_installed_version)"
+                    if [[ -z "$mv" ]]; then
+                        mv="$(get_latest_version)"
+                    fi
+                    download_manager_scripts "${mv:-v0.9.5}"
+                    register_command ;;
+                auto)
+                    local aa
+                    aa="$(read_update_conf AUTO_APPLY false)"
+                    case "${3:-}" in
+                        on|enable|true)   install_update_checker true "$aa" ;;
+                        off|disable|false) install_update_checker false "$aa" ;;
+                        *) print_error "用法: update auto on|off"; return 1 ;;
+                    esac ;;
+                apply)
+                    local ac
+                    ac="$(read_update_conf AUTO_CHECK true)"
+                    case "${3:-}" in
+                        on|enable|true)   install_update_checker "$ac" true ;;
+                        off|disable|false) install_update_checker "$ac" false ;;
+                        *) print_error "用法: update apply on|off"; return 1 ;;
+                    esac ;;
+                *)           do_upgrade_to "$2" ;;
+            esac
+            ;;
+        check-update|check)
+            do_check_update 1
+            ;;
+        update-menu|updates)
+            if [[ -t 0 ]]; then
+                menu_update
+            else
+                do_check_update 1
+            fi
+            ;;
+        self-update)
+            do_self_update
             ;;
         uninstall|remove)
             do_uninstall
