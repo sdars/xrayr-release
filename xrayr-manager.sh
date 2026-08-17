@@ -1016,7 +1016,10 @@ menu_global() {
             read -erp "  连接空闲超时(秒) [30]: " val
             [[ -n "$val" ]] && helper set-global ConnIdle "$val" ;;
         7)
-            read -erp "  缓冲区大小(KB) [64]: " val
+            echo -e "  ${DIM}实测参考: 16 以上对速度无影响(高延迟瓶颈在内核 TCP 窗口);"
+            echo -e "  低于 16 会掉速约 20%; 缓冲按需增长非预分配, 512 在 150 并发下"
+            echo -e "  仅比 4 多占约 8MB。建议 >=2GB 内存用 512, 1~2GB 用 128。${NC}"
+            read -erp "  缓冲区大小(KB) [推荐 512, 小内存 64]: " val
             [[ -n "$val" ]] && helper set-global BufferSize "$val" ;;
         0|q) return ;;
     esac
