@@ -461,9 +461,219 @@ SVCEOF
     return 0
 }
 
-# ==================== 内核调优 ====================
+# ==================== 内核调优 (可选) ====================
+TUNE_BACKUP_ROOT="/var/backups/xrayr-tuning"
+
+# 需要备份/回滚的内核参数清单
+TUNE_SYSCTL_KEYS="net.ipv4.tcp_congestion_control net.core.default_qdisc
+net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default
+net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min
+net.core.netdev_max_backlog net.core.somaxconn net.ipv4.tcp_max_syn_backlog
+net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl
+net.ipv4.tcp_keepalive_probes net.ipv4.tcp_fin_timeout net.ipv4.tcp_tw_reuse
+net.ipv4.ip_local_port_range net.ipv4.tcp_mtu_probing net.ipv4.tcp_notsent_lowat
+net.ipv4.tcp_fastopen net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_no_metrics_save
+net.ipv4.ip_forward net.netfilter.nf_conntrack_max
+net.netfilter.nf_conntrack_tcp_timeout_established
+net.netfilter.nf_conntrack_udp_timeout net.netfilter.nf_conntrack_udp_timeout_stream"
+
+# 备份当前内核参数与相关文件, 并生成独立回滚脚本
+tune_backup() {
+    local ts bdir k v
+    ts="$(date +%Y%m%d-%H%M%S)"
+    bdir="${TUNE_BACKUP_ROOT}/${ts}"
+    mkdir -p "${bdir}/files"
+
+    # 备份可能被覆盖的文件
+    local f
+    for f in /etc/sysctl.conf /etc/sysctl.d/99-xrayr-perf.conf \
+             /etc/security/limits.d/99-xrayr.conf \
+             /etc/systemd/system/XrayR.service \
+             /etc/systemd/system/XrayR.service.d/perf.conf \
+             /etc/systemd/system/XrayR.service.d/limits.conf; do
+        if [[ -f "$f" ]]; then
+            mkdir -p "${bdir}/files$(dirname "$f")"
+            cp -a "$f" "${bdir}/files${f}"
+        fi
+    done
+
+    # 快照内核参数原值
+    : > "${bdir}/sysctl-original.txt"
+    for k in $TUNE_SYSCTL_KEYS; do
+        v="$(sysctl -n "$k" 2>/dev/null)"
+        if [[ -n "$v" ]]; then
+            printf '%s = %s\n' "$k" "$(echo "$v" | tr '\t' ' ')" >> "${bdir}/sysctl-original.txt"
+        else
+            printf '# %s = (调优前该参数不存在/模块未加载)\n' "$k" >> "${bdir}/sysctl-original.txt"
+        fi
+    done
+
+    # 记录调优前已存在的文件清单(用于识别哪些是调优新增的)
+    ls -1 /etc/sysctl.d/ 2>/dev/null > "${bdir}/sysctl.d-before.txt"
+    ls -1 /etc/security/limits.d/ 2>/dev/null > "${bdir}/limits.d-before.txt"
+    ls -1 /etc/systemd/system/XrayR.service.d/ 2>/dev/null > "${bdir}/XrayR.service.d-before.txt"
+
+    {
+        echo "备份时间: $(date -Is)"
+        echo "主机: $(hostname)"
+        echo "内核: $(uname -r)"
+        echo "调优前拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+        echo "调优前默认qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    } > "${bdir}/state-before.txt"
+
+    # 生成独立回滚脚本
+    cat > "${bdir}/restore.sh" << 'RESTOREEOF'
+#!/bin/bash
+# XrayR 调优回滚脚本 (自动生成)
+# 用法: bash restore.sh [--yes]
+set +e
+BDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+G=$'\033[0;32m'; Y=$'\033[0;33m'; C=$'\033[0;36m'; R=$'\033[0;31m'; N=$'\033[0m'
+echo ""
+echo "${C}=== XrayR 调优回滚 -> 恢复到调优前状态 ===${N}"
+if [[ -f "$BDIR/state-before.txt" ]]; then
+    sed 's/^/  /' "$BDIR/state-before.txt"
+fi
+echo ""
+if [[ "$1" != "--yes" ]] && [[ "$1" != "-y" ]]; then
+    read -erp "确认回滚? 输入 yes: " ok
+    if [[ "$ok" != "yes" ]]; then echo "${Y}已取消${N}"; exit 0; fi
+fi
+
+echo "${C}[1/4] 恢复被覆盖的文件${N}"
+if [[ -d "$BDIR/files" ]]; then
+    (cd "$BDIR/files" && find . -type f 2>/dev/null) | while read -r rel; do
+        cp -a "$BDIR/files/${rel#./}" "/${rel#./}" && echo "  已恢复 /${rel#./}"
+    done
+fi
+
+echo "${C}[2/4] 删除调优新增的文件${N}"
+clean_new() {
+    local dir="$1" lst="$2" f base
+    [[ -d "$dir" ]] || return 0
+    [[ -f "$lst" ]] || return 0
+    for f in "$dir"/*; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        if ! grep -qxF "$base" "$lst" 2>/dev/null; then
+            rm -f "$f" && echo "  已删除 $f"
+        fi
+    done
+}
+clean_new /etc/sysctl.d "$BDIR/sysctl.d-before.txt"
+clean_new /etc/security/limits.d "$BDIR/limits.d-before.txt"
+clean_new /etc/systemd/system/XrayR.service.d "$BDIR/XrayR.service.d-before.txt"
+
+echo "${C}[3/4] 回写内核参数原值${N}"
+okc=0; skipc=0
+while IFS= read -r line; do
+    case "$line" in \#*|"") continue ;; esac
+    k="${line%% = *}"; v="${line#* = }"
+    if sysctl -w "$k=$v" >/dev/null 2>&1; then okc=$((okc+1)); else skipc=$((skipc+1)); fi
+done < "$BDIR/sysctl-original.txt"
+echo "  已回写 $okc 项, 跳过 $skipc 项"
+sysctl --system >/dev/null 2>&1
+
+echo "${C}[4/4] 重载并重启服务${N}"
+systemctl daemon-reload
+systemctl restart XrayR 2>/dev/null
+sleep 3
+echo ""
+echo "  服务状态 : $(systemctl is-active XrayR 2>/dev/null)"
+echo "  拥塞控制 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+echo "  默认qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+echo "  rmem_max : $(sysctl -n net.core.rmem_max 2>/dev/null)"
+echo ""
+echo "${G}回滚完成${N}"
+RESTOREEOF
+    chmod +x "${bdir}/restore.sh"
+    echo "${bdir}" > /var/lib/.xrayr-last-tuning-backup 2>/dev/null
+    TUNE_LAST_BACKUP="$bdir"
+    print_ok "调优前状态已备份: ${CYAN}${bdir}${NC}"
+    print_info "回滚命令: ${GREEN}bash ${bdir}/restore.sh${NC}  或面板内 [回滚调优]"
+    return 0
+}
+
+# 显示当前网络参数现状, 供用户判断是否需要调优
+tune_show_current() {
+    local cc qd rmax keep somax nproc_v
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    qd="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    rmax="$(sysctl -n net.core.rmem_max 2>/dev/null)"
+    keep="$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)"
+    somax="$(sysctl -n net.core.somaxconn 2>/dev/null)"
+    nproc_v="$(systemctl show XrayR -p LimitNPROC --value 2>/dev/null)"
+
+    # 中文列对齐 (中文按 2 列宽计算)
+    _trow() {
+        local a="$1" b="$2" c="$3" dw pad
+        dw=$(awk -v s="$a" 'BEGIN{
+            n=length(s); w=0;
+            for(i=1;i<=n;i++){ ch=substr(s,i,1); w += (ch ~ /[\x80-\xff]/) ? 0 : 1 }
+            bl=0; cmd="printf %s \047" s "\047 | wc -c"; cmd | getline bl; close(cmd);
+            print w + ((bl-w)/3)*2
+        }')
+        pad=$((22-dw)); [[ $pad -lt 1 ]] && pad=1
+        printf "    %s%*s%-16s %s\n" "$a" "$pad" "" "$b" "$c"
+    }
+    echo ""
+    echo -e "  ${BOLD}当前系统网络参数${NC}"
+    _trow "参数" "当前值" "调优目标值"
+    echo -e "    ${DIM}──────────────────────────────────────────────${NC}"
+    _trow "拥塞控制算法" "${cc:-未知}" "bbr"
+    _trow "默认队列调度" "${qd:-未知}" "fq"
+    _trow "接收缓冲上限" "${rmax:-未知}" "67108864"
+    _trow "TCP保活时间(秒)" "${keep:-未知}" "300"
+    _trow "somaxconn" "${somax:-未知}" "65535"
+    _trow "服务进程数上限" "${nproc_v:-未知}" "infinity"
+    unset -f _trow
+
+    # 已有自定义 sysctl 配置提示
+    local existing
+    existing="$(ls /etc/sysctl.d/*.conf 2>/dev/null | grep -v '99-xrayr-perf.conf' | head -5)"
+    if [[ -n "$existing" ]]; then
+        print_warn "检测到系统已有自定义 sysctl 配置:"
+        echo "$existing" | sed 's/^/      /'
+        print_warn "若已针对本机手动调优过, 建议选择 [跳过] 以免覆盖"
+    fi
+    if [[ "$cc" == "bbr" ]] && [[ "$qd" == "fq" ]] && [[ "${rmax:-0}" -ge 16777216 ]]; then
+        print_ok "本机看起来已完成过网络调优, 可直接跳过"
+    fi
+    return 0
+}
+
+# install_kernel_tuning [mode]
+#   full   = 全量调优 (默认)
+#   safe   = 仅保守项 (不改拥塞控制/qdisc, 只调缓冲/保活/backlog)
 install_kernel_tuning() {
-    print_info "应用内核网络调优 (BBR + fq + 大缓冲 + keepalive + conntrack)..."
+    local mode="${1:-full}"
+
+    # 调优前自动备份 + 生成回滚脚本
+    tune_backup
+
+    if [[ "$mode" == "safe" ]]; then
+        print_info "应用保守调优 (保留现有拥塞控制与 qdisc)..."
+        cat > /etc/sysctl.d/99-xrayr-perf.conf << 'SAFEEOF'
+# XrayR 保守调优 (不改动拥塞控制算法与队列调度)
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 32768
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+SAFEEOF
+        sysctl --system >/dev/null 2>&1
+        print_ok "保守调优已应用 (拥塞控制保持: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null))"
+        return 0
+    fi
+
+    print_info "应用全量内核网络调优 (BBR + fq + 大缓冲 + keepalive + conntrack)..."
     cat > /etc/sysctl.d/99-xrayr-perf.conf << 'SYSEOF'
 # XrayR 性能与稳定性调优
 # 拥塞控制
@@ -525,6 +735,103 @@ LIMEOF
     else
         print_warn "内核调优已写入, 但当前拥塞控制仍为: ${cc:-未知} (可能需重启或内核不支持 BBR)"
     fi
+    return 0
+}
+
+# 交互询问是否执行内核调优 (可选, 默认跳过以免覆盖既有优化)
+# 调优管理子菜单 (可选调优 + 回滚)
+menu_tuning() {
+    while true
+    do
+        show_banner
+        echo -e "${BOLD}   内核网络调优管理${NC}  ${DIM}(全部可选, 调优前自动备份)${NC}"
+        tune_show_current
+
+        local bdir=""
+        if [[ -f /var/lib/.xrayr-last-tuning-backup ]]; then
+            bdir="$(cat /var/lib/.xrayr-last-tuning-backup 2>/dev/null)"
+        fi
+        if [[ -n "$bdir" ]] && [[ -d "$bdir" ]]; then
+            echo -e "   最近备份 : ${CYAN}${bdir}${NC}"
+        else
+            echo -e "   最近备份 : ${DIM}无 (尚未执行过调优)${NC}"
+        fi
+        echo ""
+        echo -e "   ${GREEN}1)${NC} 保守调优 ${DIM}(只调缓冲/保活/backlog, 保留拥塞控制与 qdisc)${NC}"
+        echo -e "   ${GREEN}2)${NC} 全量调优 ${DIM}(BBR + fq + 大缓冲 + keepalive + conntrack)${NC}"
+        echo -e "   ${GREEN}3)${NC} ${YELLOW}回滚到调优前状态${NC}"
+        echo -e "   ${GREEN}4)${NC} 查看所有备份点"
+        echo -e "   ${GREEN}5)${NC} 仅备份当前状态 ${DIM}(不做任何修改)${NC}"
+        echo -e "   ${GREEN}0)${NC} 返回上级菜单"
+        echo ""
+        local c=""
+        if ! read -erp "   请选择 [0-5]: " c; then
+            echo ""
+            print_info "输入已结束, 返回"
+            return 0
+        fi
+        case "$c" in
+            1) install_kernel_tuning safe; pause ;;
+            2) install_kernel_tuning full; pause ;;
+            3)
+                local rb=""
+                if [[ -f /var/lib/.xrayr-last-tuning-backup ]]; then
+                    rb="$(cat /var/lib/.xrayr-last-tuning-backup 2>/dev/null)"
+                fi
+                if [[ -n "$rb" ]] && [[ -x "${rb}/restore.sh" ]]; then
+                    bash "${rb}/restore.sh"
+                else
+                    print_error "找不到可用的备份点"
+                    print_info "备份目录: ${TUNE_BACKUP_ROOT}"
+                fi
+                pause ;;
+            4)
+                echo ""
+                if [[ -d "$TUNE_BACKUP_ROOT" ]]; then
+                    local d
+                    for d in "$TUNE_BACKUP_ROOT"/*; do
+                        [[ -d "$d" ]] || continue
+                        echo -e "   ${CYAN}$(basename "$d")${NC}"
+                        if [[ -f "$d/state-before.txt" ]]; then
+                            sed 's/^/       /' "$d/state-before.txt"
+                        fi
+                        echo -e "       ${DIM}回滚: bash ${d}/restore.sh${NC}"
+                        echo ""
+                    done
+                else
+                    print_info "暂无备份点"
+                fi
+                pause ;;
+            5) tune_backup; pause ;;
+            0) return 0 ;;
+            *) print_warn "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+prompt_kernel_tuning() {
+    local interactive="${1:-1}"
+
+    if [[ "$interactive" != "1" ]]; then
+        print_info "非交互安装: 已跳过内核调优 (如需调优请运行 ${GREEN}xrayr-install tune${NC} 或面板内选择)"
+        return 0
+    fi
+
+    tune_show_current
+
+    echo -e "  ${BOLD}是否应用内核网络调优?${NC} ${DIM}(调优前会自动备份并生成回滚脚本)${NC}"
+    echo ""
+    echo -e "    ${GREEN}1)${NC} 跳过 ${DIM}(推荐: 本机已手动调优过, 或不确定时)${NC}"
+    echo -e "    ${GREEN}2)${NC} 保守调优 ${DIM}(只调缓冲/保活/backlog, 不动拥塞控制与 qdisc)${NC}"
+    echo -e "    ${GREEN}3)${NC} 全量调优 ${DIM}(BBR + fq + 大缓冲 + keepalive + conntrack)${NC}"
+    echo ""
+    local tc=""
+    read -erp "  请选择 [1-3, 默认=1 跳过]: " tc
+    case "$tc" in
+        2) install_kernel_tuning safe ;;
+        3) install_kernel_tuning full ;;
+        *) print_info "已跳过内核调优 (保留系统现有网络参数)" ;;
+    esac
     return 0
 }
 
@@ -928,7 +1235,7 @@ do_install() {
     install_config_files
     install_geodata "$interactive"
     install_systemd_service
-    install_kernel_tuning
+    prompt_kernel_tuning "$interactive"
     install_log_limits
     install_geo_cron
     register_command
@@ -1194,7 +1501,7 @@ menu_tools() {
         done
         echo ""
         echo -e "   ${GREEN}1)${NC} 自动安装缺失依赖"
-        echo -e "   ${GREEN}2)${NC} 重新应用内核网络调优 (BBR/大缓冲/keepalive)"
+        echo -e "   ${GREEN}2)${NC} 内核网络调优管理 ${DIM}(可选/可回滚)${NC}"
         echo -e "   ${GREEN}3)${NC} 重新安装日志大小限制"
         echo -e "   ${GREEN}4)${NC} 重新注册 xrayr 命令"
         echo -e "   ${GREEN}5)${NC} 重新生成 systemd 服务"
@@ -1210,7 +1517,7 @@ menu_tools() {
         fi
         case "$c" in
             1) install_dependencies; pause ;;
-            2) install_kernel_tuning; pause ;;
+            2) menu_tuning ;;
             3) install_log_limits; pause ;;
             4) register_command; pause ;;
             5) install_systemd_service; pause ;;
@@ -1310,7 +1617,11 @@ show_help() {
     echo -e "  uninstall      卸载"
     echo -e "  deps           仅检查并安装依赖"
     echo -e "  log-limit      仅安装日志大小限制
-  tune           仅应用内核网络调优 (BBR/大缓冲/keepalive)"
+  tune show      查看当前网络参数与调优目标值对比
+  tune safe      保守调优 (不动拥塞控制/qdisc)
+  tune full      全量调优 (BBR + fq + 大缓冲 + keepalive)
+  tune backup    仅备份当前状态并生成回滚脚本
+  tune restore   回滚到调优前状态"
     echo -e "  geo            仅更新 GeoData"
     echo -e "  status         打印当前状态"
     echo -e "  help           显示本帮助"
@@ -1353,7 +1664,30 @@ main() {
             install_log_limits
             ;;
         tune|tuning|sysctl)
-            install_kernel_tuning
+            case "${2:-}" in
+                safe)    install_kernel_tuning safe ;;
+                full|"") install_kernel_tuning full ;;
+                restore|rollback)
+                    local rb=""
+                    if [[ -f /var/lib/.xrayr-last-tuning-backup ]]; then
+                        rb="$(cat /var/lib/.xrayr-last-tuning-backup 2>/dev/null)"
+                    fi
+                    if [[ -n "$rb" ]] && [[ -x "${rb}/restore.sh" ]]; then
+                        bash "${rb}/restore.sh" "${3:-}"
+                    else
+                        print_error "找不到可用的备份点 (目录: ${TUNE_BACKUP_ROOT})"
+                        return 1
+                    fi
+                    ;;
+                show|status)
+                    tune_show_current ;;
+                backup)
+                    tune_backup ;;
+                *)
+                    print_error "未知调优子命令: $2"
+                    echo "  可用: safe | full | restore | show | backup"
+                    return 1 ;;
+            esac
             ;;
         geo|geodata)
             if [[ -x "${INSTALL_DIR}/geo-update.sh" ]]; then
