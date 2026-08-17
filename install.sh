@@ -269,14 +269,26 @@ read_version_state() {
 }
 
 # 从二进制里提取内嵌的 Xray 内核版本
+# 优先级: XrayR version 自报 (0.9.6+ 内置, 无外部依赖)
+#      -> strings 扫描 (兼容 0.9.5 及更早, 需 binutils)
+#      -> go version -m (Go 工具链存在时可用)
+# 精简系统常常没有 strings/readelf, 因此不能只依赖它。
 get_core_version() {
     if [[ ! -x "${INSTALL_DIR}/XrayR" ]]; then
         return 0
     fi
-    local v
-    v="$("${INSTALL_DIR}/XrayR" version 2>/dev/null | grep -oE 'Xray-core v?[0-9.]+' | head -1 | grep -oE '[0-9][0-9.]*')"
+    local v out
+    out="$("${INSTALL_DIR}/XrayR" version 2>/dev/null)"
+    v="$(echo "$out" | grep -iE '^Xray-core' | head -1 | grep -oE 'v?1\.[0-9]+\.[0-9]+' | head -1)"
+    if [[ -z "$v" ]] && command -v strings >/dev/null 2>&1; then
+        v="$(strings "${INSTALL_DIR}/XrayR" 2>/dev/null | grep -oE '^v1\.[0-9]{6}\.[0-9]+$' | sort -Vu | tail -1)"
+    fi
+    if [[ -z "$v" ]] && command -v go >/dev/null 2>&1; then
+        v="$(go version -m "${INSTALL_DIR}/XrayR" 2>/dev/null | awk '$2=="github.com/xtls/xray-core"{print $3; exit}')"
+    fi
     if [[ -z "$v" ]]; then
-        v="$(strings "${INSTALL_DIR}/XrayR" 2>/dev/null | grep -oE '^v?1\.2[0-9]{5}\.[0-9]+$' | sort -u | tail -1)"
+        # 最后兜底: 用 grep 直接在二进制里找模块版本串 (grep -a 处理二进制)
+        v="$(grep -aoE 'github\.com/xtls/xray-core@v1\.[0-9]{6}\.[0-9]+' "${INSTALL_DIR}/XrayR" 2>/dev/null | head -1 | sed 's/.*@//')"
     fi
     echo "$v"
     return 0
@@ -372,7 +384,8 @@ do_check_update() {
     cur_bin="$(get_installed_version)"
     cur_script="$(get_installed_script_version)"
     cur_core="$(read_version_state CORE_VERSION)"
-    if [[ -z "$cur_core" ]]; then
+    # 旧版 .version 里可能记着 unknown (当时没有 strings), 需要重新探测
+    if [[ -z "$cur_core" ]] || [[ "$cur_core" == "unknown" ]]; then
         cur_core="$(get_core_version)"
     fi
 
@@ -854,7 +867,7 @@ menu_update() {
         cur_bin="$(get_installed_version)"
         cur_script="$(get_installed_script_version)"
         cur_core="$(read_version_state CORE_VERSION)"
-        if [[ -z "$cur_core" ]]; then
+        if [[ -z "$cur_core" ]] || [[ "$cur_core" == "unknown" ]]; then
             cur_core="$(get_core_version)"
         fi
         echo -e "   主程序版本   : ${GREEN}${cur_bin:-未安装}${NC}"
@@ -1981,7 +1994,7 @@ show_status_block() {
         echo -e "   安装状态   ${GREEN}已安装${NC}    程序版本  ${GREEN}${ver}${NC}"
         local _core
         _core="$(read_version_state CORE_VERSION)"
-        if [[ -z "$_core" ]]; then
+        if [[ -z "$_core" ]] || [[ "$_core" == "unknown" ]]; then
             _core="$(get_core_version)"
         fi
         if [[ -n "$_core" ]]; then
