@@ -15,6 +15,19 @@ RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 UPDATE_CACHE_FILE="/var/lib/.xrayr-update-cache"
 UPDATE_CACHE_TTL=3600
 
+# 按显示宽度补齐 (中文占 2 列, UTF-8 占 3 字节, printf %-Ns 会错位)
+pad_disp() {
+    local str="$1" want="${2:-16}"
+    local bytes chars wide w pad
+    bytes="$(printf '%s' "$str" | wc -c)"
+    chars="$(printf '%s' "$str" | wc -m)"
+    wide=$(( (bytes - chars) / 2 ))
+    w=$(( chars + wide ))
+    pad=$(( want - w ))
+    if [[ "$pad" -lt 0 ]]; then pad=0; fi
+    printf '%s%*s' "$str" "$pad" ""
+}
+
 # Colors
 RED=$'\e[0;31m'
 GREEN=$'\e[0;32m'
@@ -148,11 +161,11 @@ do_version() {
     echo ""
     echo -e "  ${CYAN}${BOLD}────────────  版本信息  ────────────${NC}"
     echo ""
-    printf "  %-16s %s\n" "XrayR 主程序" "${bin_ver:-未知}"
-    printf "  %-16s %s\n" "Xray 内核" "${core_ver:-未知}"
-    printf "  %-16s %s\n" "安装脚本版本" "${script_ver:-未记录}"
-    printf "  %-16s %s\n" "安装架构" "${inst_arch:-未知}"
-    printf "  %-16s %s\n" "安装时间" "${inst_time:-未知}"
+    echo "  $(pad_disp 'XrayR 主程序' 16) ${bin_ver:-未知}"
+    echo "  $(pad_disp 'Xray 内核' 16) ${core_ver:-未知}"
+    echo "  $(pad_disp '安装脚本版本' 16) ${script_ver:-未记录}"
+    echo "  $(pad_disp '安装架构' 16) ${inst_arch:-未知}"
+    echo "  $(pad_disp '安装时间' 16) ${inst_time:-未知}"
     # 在线查询最新版本, 只有存在更新时才提示 (用户要求: 常态只显示本地)
     local latest bv sv has_new=0
     latest="$(_mgr_check_latest)"
