@@ -10,7 +10,7 @@ INSTALL_DIR="/usr/local/XrayR"
 HELPER="${INSTALL_DIR}/config_helper.py"
 
 # 管理脚本自身版本 (启动时按此比对远端, 有更新则静默升级)
-MGR_VERSION="1.1.0"
+MGR_VERSION="1.1.1"
 
 # 更新检查相关 (与 install.sh 保持一致)
 REPO="sdars/xrayr-release"
@@ -29,6 +29,19 @@ pad_disp() {
     pad=$(( want - w ))
     if [[ "$pad" -lt 0 ]]; then pad=0; fi
     printf '%s%*s' "$str" "$pad" ""
+}
+
+# 从 raw 拉文件, 带 cache-buster + no-cache 头绕过 CDN 缓存
+# raw.githubusercontent 有约 5 分钟 CDN 缓存, 不绕过会导致刚推的版本检测不到
+_mgr_raw_fetch() {
+    local file="$1" out="${2:-}"
+    local url="${RAW_BASE}/${file}?nocache=$(date +%s)"
+    if [[ -n "$out" ]]; then
+        curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --max-time 20 -o "$out" "$url" 2>/dev/null
+        return $?
+    fi
+    curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --max-time 8 "$url" 2>/dev/null
+    return $?
 }
 
 # 每次启动静默自升级 (缓存 1 小时避免频繁网络请求)
@@ -52,8 +65,8 @@ _mgr_silent_selfupdate() {
 
     # 静默拉取远端两个脚本的版本行 (只读一行, 快且省流量)
     local remote_mgr remote_ins
-    remote_mgr="$(curl -sL --max-time 6 "${RAW_BASE}/xrayr-manager.sh" 2>/dev/null | grep -m1 '^MGR_VERSION=' | cut -d'"' -f2)"
-    remote_ins="$(curl -sL --max-time 6 "${RAW_BASE}/install.sh"       2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+    remote_mgr="$(_mgr_raw_fetch xrayr-manager.sh | grep -m1 '^MGR_VERSION=' | cut -d'"' -f2)"
+    remote_ins="$(_mgr_raw_fetch install.sh       | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
 
     # 无论有无新版都写缓存, 避免同一时段反复重试
     mkdir -p "$(dirname "$cache")" "${INSTALL_DIR}" 2>/dev/null
@@ -66,7 +79,9 @@ _mgr_silent_selfupdate() {
         old_ins="$(grep -m1 '^SCRIPT_VERSION=' "${INSTALL_DIR}/install.sh" 2>/dev/null | cut -d'"' -f2)"
         if [[ -z "$old_ins" ]] || _mgr_ver_lt "$old_ins" "$remote_ins"; then
             local tmp1="/tmp/.xrayr-install-selfupd.sh"
-            if curl -fsSLo "$tmp1" "${RAW_BASE}/install.sh" 2>/dev/null                 && bash -n "$tmp1" 2>/dev/null                 && grep -q 'do_install()' "$tmp1"; then
+            if _mgr_raw_fetch install.sh "$tmp1" \
+                && bash -n "$tmp1" 2>/dev/null \
+                && grep -q 'do_install()' "$tmp1"; then
                 install -m 755 "$tmp1" "${INSTALL_DIR}/install.sh"
                 ln -sf "${INSTALL_DIR}/install.sh" /usr/local/bin/xrayr-install
                 if [[ -f /etc/XrayR/.version ]]; then
@@ -81,7 +96,10 @@ _mgr_silent_selfupdate() {
     # 2) xrayr-manager.sh 静默升级 (需要 exec 重启当前进程, 否则本次跑的仍是旧代码)
     if [[ -n "$remote_mgr" ]] && _mgr_ver_lt "$MGR_VERSION" "$remote_mgr"; then
         local tmp2="/tmp/.xrayr-manager-selfupd.sh"
-        if curl -fsSLo "$tmp2" "${RAW_BASE}/xrayr-manager.sh" 2>/dev/null             && bash -n "$tmp2" 2>/dev/null             && grep -q 'interactive_menu()' "$tmp2"             && grep -q '^MGR_VERSION=' "$tmp2"; then
+        if _mgr_raw_fetch xrayr-manager.sh "$tmp2" \
+            && bash -n "$tmp2" 2>/dev/null \
+            && grep -q 'interactive_menu()' "$tmp2" \
+            && grep -q '^MGR_VERSION=' "$tmp2"; then
             install -m 755 "$tmp2" "${INSTALL_DIR}/xrayr-manager.sh"
             cp -f "${INSTALL_DIR}/xrayr-manager.sh" /usr/local/bin/xrayr
             chmod +x /usr/local/bin/xrayr
@@ -271,7 +289,7 @@ do_version() {
     fi
     # 管理脚本自身版本比对 (启动时会静默自升级, 这里只作显示)
     local remote_mgr
-    remote_mgr="$(curl -sL --max-time 4 "${RAW_BASE}/xrayr-manager.sh" 2>/dev/null | grep -m1 '^MGR_VERSION=' | cut -d'"' -f2)"
+    remote_mgr="$(_mgr_raw_fetch xrayr-manager.sh | grep -m1 '^MGR_VERSION=' | cut -d'"' -f2)"
     if [[ -n "$remote_mgr" ]] && _mgr_ver_lt "$MGR_VERSION" "$remote_mgr"; then
         has_new=1
         echo ""
@@ -308,9 +326,9 @@ do_update_mgmt() {
     fi
     local tmp="/tmp/xrayr-install-fetch.sh"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSLo "$tmp" "${RAW_BASE}/install.sh" 2>/dev/null
+        _mgr_raw_fetch install.sh "$tmp"
     else
-        wget -qO "$tmp" "${RAW_BASE}/install.sh" 2>/dev/null
+        wget -qO "$tmp" "${RAW_BASE}/install.sh?nocache=$(date +%s)" 2>/dev/null
     fi
     if [[ ! -s "$tmp" ]] || ! bash -n "$tmp" 2>/dev/null; then
         print_error "远端脚本下载或校验失败"
@@ -343,7 +361,7 @@ _mgr_check_latest() {
     fi
     local bv sv
     bv="$(curl -sL --max-time 8 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
-    sv="$(curl -sL --max-time 8 "${RAW_BASE}/install.sh" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
+    sv="$(_mgr_raw_fetch install.sh | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)"
     if [[ -n "$bv" ]] || [[ -n "$sv" ]]; then
         mkdir -p "$(dirname "$UPDATE_CACHE_FILE")" 2>/dev/null
         echo "${bv}|${sv}" > "$UPDATE_CACHE_FILE" 2>/dev/null
