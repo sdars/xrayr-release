@@ -26,7 +26,7 @@ COMMAND_LINK="/usr/local/bin/xrayr"
 
 # ==================== 版本与在线更新 ====================
 # 本安装脚本自身的版本号 (每次发布递增, 用于脚本自更新比对)
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 # 记录已安装的版本元数据 (二进制版本 / 脚本版本 / 安装时间 / 内嵌内核)
 VERSION_STATE_FILE="/etc/XrayR/.version"
 # 更新检查缓存 (避免频繁打 GitHub API), 单位秒
@@ -1147,6 +1147,29 @@ Nodes:
         KeyFile: ""
         Provider: ""
         Email: ""
+      # ---------------------------------------------------------------
+      # 入站 Socket 调优（可选，默认全部关闭 = 保持系统/内核既有行为）
+      # 说明: 原版 XrayR 只在「非 tcp/ws 传输 + 开启 ProxyProtocol」时才下发
+      #       sockopt，导致纯 TCP 入站(Shadowsocks/VMess-tcp 等)完全没有 socket
+      #       调优能力。本版已修复为任意传输协议均可下发。
+      #
+      # TCPFastOpen: 开启后客户端可在 SYN 包中携带数据，省掉「客户端<->本机」
+      #   整 1 个 RTT 的三次握手。对 SS2022/VLESS 这类 0-RTT 协议收益最直接，
+      #   客户端 RTT 越高收益越大(200ms 客户端实测冷连接 TTFB 降低约 5%~20%)。
+      #   需内核 net.ipv4.tcp_fastopen 含服务端位(值 2 或 3)才真正生效，
+      #   可用管理脚本「入站 Socket 调优」菜单自动检查并设置。
+      # SocketConfig:
+      #   TCPFastOpen: true
+      #   TCPFastOpenQueueLength: 4096   # TFO 半开队列，0=用 xray 默认(256)
+      #   TCPKeepAliveIdle: 30           # 空闲多少秒后开始 keepalive 探测
+      #   TCPKeepAliveInterval: 15       # keepalive 探测间隔(秒)
+      #   TCPUserTimeout: 0              # 未确认数据最大存活(毫秒)，0=不设置
+      #   TCPCongestion: ""              # 该入站独立拥塞算法，如 bbr
+      #   TCPMptcp: false                # Multipath TCP，需内核 5.6+ 且客户端支持
+      #   TCPWindowClamp: 0              # 通告窗口上限(字节)，0=不设置
+      #   TCPMaxSeg: 0                   # 单段最大长度(字节)，0=不设置
+      #   Interface: ""                  # 绑定网卡名，空=不绑定
+      # ---------------------------------------------------------------
 CFGEOF
         print_ok "默认配置已生成"
         # BufferSize 按内存自适应 (依据实测: 编译机 xray 26.3.27 压测)
