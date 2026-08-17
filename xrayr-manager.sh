@@ -10,7 +10,7 @@ INSTALL_DIR="/usr/local/XrayR"
 HELPER="${INSTALL_DIR}/config_helper.py"
 
 # 管理脚本自身版本 (启动时按此比对远端, 有更新则静默升级)
-MGR_VERSION="1.1.1"
+MGR_VERSION="1.2.0"
 
 # 更新检查相关 (与 install.sh 保持一致)
 REPO="sdars/xrayr-release"
@@ -1802,6 +1802,330 @@ menu_log_limit() {
     done
 }
 
+# ========== 入站 Socket 调优 ==========
+# 全部为可选项，默认不改动系统既有状态。每次写入前自动备份并生成 restore.sh。
+
+SOCKOPT_SYSCTL_FILE="/etc/sysctl.d/99-xrayr-tfo.conf"
+
+_tfo_kernel_val() { sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0; }
+
+_tfo_desc() {
+    local v="$1"
+    case "$v" in
+        0) echo "完全关闭" ;;
+        1) echo "仅客户端(作为服务端不接受 TFO)" ;;
+        2) echo "仅服务端(推荐: 纯服务端节点)" ;;
+        3) echo "客户端+服务端(推荐: 兼作出站/中转)" ;;
+        *) echo "自定义位图" ;;
+    esac
+}
+
+_sockopt_cfg_state() {
+    if [[ ! -f "${CONFIG_DIR}/config.yml" ]]; then
+        echo "未安装"
+        return
+    fi
+    if grep -qE '^[[:space:]]*SocketConfig:[[:space:]]*$' "${CONFIG_DIR}/config.yml" 2>/dev/null; then
+        if grep -qE '^[[:space:]]*TCPFastOpen:[[:space:]]*true' "${CONFIG_DIR}/config.yml" 2>/dev/null; then
+            echo "已启用"
+        else
+            echo "已配置但未开启 TFO"
+        fi
+    else
+        echo "未配置(保持默认)"
+    fi
+}
+
+_show_sockopt_status() {
+    local kv kd cs nodes
+    kv="$(_tfo_kernel_val)"
+    kd="$(_tfo_desc "$kv")"
+    cs="$(_sockopt_cfg_state)"
+    echo -e "  ${BOLD}当前状态${NC}"
+    echo "  ┌────────────────────┬──────────────────────────────────────────┐"
+    printf '  │ %s │ %s │\n' "$(pad_disp '内核 TFO 开关' 18)" "$(pad_disp "${kv} (${kd})" 40)"
+    printf '  │ %s │ %s │\n' "$(pad_disp 'XrayR 配置状态' 18)" "$(pad_disp "${cs}" 40)"
+    if [[ -f /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec ]]; then
+        local bh
+        bh="$(sysctl -n net.ipv4.tcp_fastopen_blackhole_timeout_sec 2>/dev/null)"
+        local bhd="已禁用黑洞检测(推荐)"
+        if [[ "$bh" != "0" ]]; then bhd="${bh}秒内探测到丢包则暂停 TFO"; fi
+        printf '  │ %s │ %s │\n' "$(pad_disp '黑洞检测' 18)" "$(pad_disp "${bhd}" 40)"
+    fi
+    echo "  └────────────────────┴──────────────────────────────────────────┘"
+    echo ""
+    echo -e "  ${BOLD}TFO 握手统计 (内核累计)${NC}"
+    if command -v nstat >/dev/null 2>&1; then
+        local pass pfail ckreq ovf
+        pass="$(nstat -az 2>/dev/null  | awk '/TCPFastOpenPassive /{print $2}')"
+        pfail="$(nstat -az 2>/dev/null | awk '/TCPFastOpenPassiveFail/{print $2}')"
+        ckreq="$(nstat -az 2>/dev/null | awk '/TCPFastOpenCookieReqd/{print $2}')"
+        ovf="$(nstat -az 2>/dev/null   | awk '/TCPFastOpenListenOverflow/{print $2}')"
+        echo "  ┌──────────────────────────────┬────────────┐"
+        printf '  │ %s │ %s │\n' "$(pad_disp '成功接受的 TFO 连接' 28)" "$(pad_disp "${pass:-0}" 10)"
+        printf '  │ %s │ %s │\n' "$(pad_disp '接受失败次数' 28)" "$(pad_disp "${pfail:-0}" 10)"
+        printf '  │ %s │ %s │\n' "$(pad_disp '客户端索取 cookie 次数' 28)" "$(pad_disp "${ckreq:-0}" 10)"
+        printf '  │ %s │ %s │\n' "$(pad_disp '半开队列溢出' 28)" "$(pad_disp "${ovf:-0}" 10)"
+        echo "  └──────────────────────────────┴────────────┘"
+        if [[ "${pass:-0}" == "0" && "${ckreq:-0}" != "0" ]]; then
+            print_warn "检测到客户端在索取 cookie 但无成功连接: 内核服务端位可能未开启"
+        fi
+        if [[ "${ovf:-0}" != "0" ]]; then
+            print_warn "半开队列有溢出: 建议增大 TCPFastOpenQueueLength"
+        fi
+    else
+        echo "  (未安装 nstat, 无法读取统计; 可执行 apt install iproute2)"
+    fi
+}
+
+_sockopt_backup() {
+    local ts bk
+    ts="$(date +%Y%m%d-%H%M%S)"
+    bk="/root/xrayr-restore-${ts}-sockopt"
+    mkdir -p "$bk" || return 1
+    cp -f "${CONFIG_DIR}/config.yml" "${bk}/config.yml" 2>/dev/null
+    _tfo_kernel_val > "${bk}/tcp_fastopen.val"
+    if [[ -f "$SOCKOPT_SYSCTL_FILE" ]]; then
+        cp -f "$SOCKOPT_SYSCTL_FILE" "${bk}/99-xrayr-tfo.conf"
+    fi
+    {
+        echo '#!/bin/bash'
+        echo '# 回滚入站 Socket 调优到本次修改之前的状态'
+        echo "systemctl stop XrayR 2>/dev/null"
+        echo "cp -f '${bk}/config.yml' '${CONFIG_DIR}/config.yml'"
+        echo "sysctl -w net.ipv4.tcp_fastopen=\$(cat '${bk}/tcp_fastopen.val') >/dev/null"
+        if [[ -f "${bk}/99-xrayr-tfo.conf" ]]; then
+            echo "cp -f '${bk}/99-xrayr-tfo.conf' '${SOCKOPT_SYSCTL_FILE}'"
+        else
+            echo "rm -f '${SOCKOPT_SYSCTL_FILE}'"
+        fi
+        echo "systemctl start XrayR 2>/dev/null"
+        echo "sleep 2"
+        echo "echo '已回滚, 服务状态: '\$(systemctl is-active XrayR)"
+    } > "${bk}/restore.sh"
+    chmod +x "${bk}/restore.sh"
+    echo "$bk"
+}
+
+_set_kernel_tfo() {
+    local want="$1"
+    sysctl -w "net.ipv4.tcp_fastopen=${want}" >/dev/null 2>&1 || return 1
+    cat > "$SOCKOPT_SYSCTL_FILE" <<EOF
+# 由 XrayR 管理脚本写入: 入站 TCP Fast Open
+net.ipv4.tcp_fastopen = ${want}
+# 禁用黑洞检测, 避免个别链路丢包导致内核长时间停用 TFO
+net.ipv4.tcp_fastopen_blackhole_timeout_sec = 0
+EOF
+    sysctl -p "$SOCKOPT_SYSCTL_FILE" >/dev/null 2>&1
+    return 0
+}
+
+menu_sockopt() {
+    while true; do
+        clear
+        echo -e "  ${CYAN}${BOLD}═══ 入站 Socket 调优 ═══${NC}"
+        echo ""
+        _show_sockopt_status
+        echo ""
+        echo -e "  ${GREEN}1)${NC} 一键开启 TFO (推荐: 自动设内核 + 写配置)"
+        echo -e "  ${GREEN}2)${NC} 仅设置内核 TFO 开关"
+        echo -e "  ${GREEN}3)${NC} 编辑 XrayR SocketConfig (逐项交互)"
+        echo -e "  ${GREEN}4)${NC} 关闭 TFO (仅改 XrayR, 不动内核)"
+        echo -e "  ${GREEN}5)${NC} 完全移除 SocketConfig (回到默认行为)"
+        echo -e "  ${GREEN}6)${NC} 重置 TFO 统计计数"
+        echo -e "  ${YELLOW}0)${NC} 返回"
+        echo ""
+        read -erp "  请选择: " c
+        case "$c" in
+            1) _sockopt_enable_all; read -erp "  按回车继续..." _ ;;
+            2) _sockopt_kernel_only; read -erp "  按回车继续..." _ ;;
+            3) _sockopt_edit; read -erp "  按回车继续..." _ ;;
+            4) _sockopt_disable_tfo; read -erp "  按回车继续..." _ ;;
+            5) _sockopt_remove; read -erp "  按回车继续..." _ ;;
+            6)
+                if command -v nstat >/dev/null 2>&1; then
+                    nstat >/dev/null 2>&1
+                    print_ok "统计计数已重置"
+                else
+                    print_error "未安装 nstat"
+                fi
+                read -erp "  按回车继续..." _ ;;
+            0|q) return ;;
+            *) print_error "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+_sockopt_kernel_only() {
+    local cur
+    cur="$(_tfo_kernel_val)"
+    echo ""
+    echo -e "  ${BOLD}内核 TFO 位图取值说明${NC}"
+    echo "  ┌──────┬──────────────────────────────────────────────────┐"
+    printf '  │ %s │ %s │\n' "$(pad_disp '取值' 4)" "$(pad_disp '含义' 48)"
+    echo "  ├──────┼──────────────────────────────────────────────────┤"
+    printf '  │ %s │ %s │\n' "$(pad_disp '0' 4)" "$(pad_disp '完全关闭 TFO' 48)"
+    printf '  │ %s │ %s │\n' "$(pad_disp '1' 4)" "$(pad_disp '仅客户端: 本机对外发起时用, 作为服务端不接受' 48)"
+    printf '  │ %s │ %s │\n' "$(pad_disp '2' 4)" "$(pad_disp '仅服务端: 纯节点机推荐, 攻击面最小' 48)"
+    printf '  │ %s │ %s │\n' "$(pad_disp '3' 4)" "$(pad_disp '客户端+服务端: 兼做中转/出站时推荐' 48)"
+    echo "  └──────┴──────────────────────────────────────────────────┘"
+    echo ""
+    echo "  提示: XrayR 作为入站服务端只需要位 2。若本机同时用 XrayR 出站到"
+    echo "        上游代理(custom_outbound 里配了 socks/http/vless 上游),"
+    echo "        则需要位 1 才能对上游发起 TFO, 此时选 3。"
+    echo ""
+    read -erp "  设为 [0/1/2/3, 当前=${cur}, 回车取消]: " want
+    if [[ -z "$want" ]]; then echo "  已取消"; return; fi
+    if [[ ! "$want" =~ ^[0-9]+$ ]]; then print_error "必须是数字"; return; fi
+    local bk
+    bk="$(_sockopt_backup)"
+    if _set_kernel_tfo "$want"; then
+        print_ok "内核 TFO 已设为 ${want} ($(_tfo_desc "$want"))"
+        echo "  已持久化到 ${SOCKOPT_SYSCTL_FILE}"
+        echo "  回滚脚本: ${bk}/restore.sh"
+    else
+        print_error "设置失败"
+    fi
+}
+
+_sockopt_enable_all() {
+    if [[ ! -f "${CONFIG_DIR}/config.yml" ]]; then
+        print_error "未找到配置文件"
+        return
+    fi
+    echo ""
+    echo "  将执行以下操作:"
+    echo "    1) 备份当前配置并生成 restore.sh"
+    echo "    2) 内核 net.ipv4.tcp_fastopen 设为 3 并持久化"
+    echo "    3) 在每个节点 ControllerConfig 下写入 SocketConfig.TCPFastOpen=true"
+    echo "    4) 重启 XrayR 并校验"
+    echo ""
+    read -erp "  确认继续? [y/N]: " ok
+    if [[ ! "$ok" =~ ^[Yy]$ ]]; then echo "  已取消"; return; fi
+
+    local bk
+    bk="$(_sockopt_backup)"
+    print_ok "备份完成: ${bk}"
+
+    _set_kernel_tfo 3 && print_ok "内核 TFO 已设为 3"
+
+    if helper sockopt-set --tcp-fast-open true --queue-length 4096 \
+        --keepalive-idle 30 --keepalive-interval 15 2>/dev/null; then
+        print_ok "SocketConfig 已写入"
+    else
+        print_error "配置写入失败, 可用 ${bk}/restore.sh 回滚"
+        return
+    fi
+
+    echo ""
+    print_info "重启服务..."
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null
+    sleep 4
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        print_ok "服务运行正常"
+        echo ""
+        echo "  验证方式: 让客户端连接后回到本菜单查看"
+        echo "  「成功接受的 TFO 连接」计数是否增长。"
+        echo "  回滚: ${bk}/restore.sh"
+    else
+        print_error "服务启动失败! 正在自动回滚..."
+        bash "${bk}/restore.sh"
+    fi
+}
+
+_sockopt_edit() {
+    if [[ ! -f "${CONFIG_DIR}/config.yml" ]]; then
+        print_error "未找到配置文件"
+        return
+    fi
+    echo ""
+    echo -e "  ${BOLD}逐项设置 (回车 = 保持当前/跳过)${NC}"
+    echo ""
+    local a b c d e f g h i j
+    read -erp "  开启 TCP Fast Open? [true/false]: " a
+    read -erp "  TFO 半开队列长度 [建议 4096]: " b
+    read -erp "  keepalive 空闲秒数 [建议 30]: " c
+    read -erp "  keepalive 探测间隔秒 [建议 15]: " d
+    read -erp "  TCPUserTimeout 毫秒 [0=不设置]: " e
+    read -erp "  该入站拥塞算法 [如 bbr, 空=不改]: " f
+    read -erp "  开启 Multipath TCP? [true/false]: " g
+    read -erp "  TCPWindowClamp 字节 [0=不设置]: " h
+    read -erp "  TCPMaxSeg 字节 [0=不设置]: " i
+    read -erp "  绑定网卡名 [空=不绑定]: " j
+
+    local args=()
+    [[ -n "$a" ]] && args+=(--tcp-fast-open "$a")
+    [[ -n "$b" ]] && args+=(--queue-length "$b")
+    [[ -n "$c" ]] && args+=(--keepalive-idle "$c")
+    [[ -n "$d" ]] && args+=(--keepalive-interval "$d")
+    [[ -n "$e" ]] && args+=(--user-timeout "$e")
+    [[ -n "$f" ]] && args+=(--congestion "$f")
+    [[ -n "$g" ]] && args+=(--mptcp "$g")
+    [[ -n "$h" ]] && args+=(--window-clamp "$h")
+    [[ -n "$i" ]] && args+=(--max-seg "$i")
+    [[ -n "$j" ]] && args+=(--bind-interface "$j")
+
+    if [[ ${#args[@]} -eq 0 ]]; then
+        echo "  未做任何修改"
+        return
+    fi
+
+    local bk
+    bk="$(_sockopt_backup)"
+    if helper sockopt-set "${args[@]}"; then
+        print_ok "已写入, 备份: ${bk}"
+        read -erp "  立即重启服务生效? [Y/n]: " r
+        if [[ ! "$r" =~ ^[Nn]$ ]]; then
+            systemctl restart "${SERVICE_NAME}" 2>/dev/null
+            sleep 3
+            if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+                print_ok "服务运行正常"
+            else
+                print_error "启动失败, 自动回滚"
+                bash "${bk}/restore.sh"
+            fi
+        fi
+    else
+        print_error "写入失败"
+    fi
+}
+
+_sockopt_disable_tfo() {
+    local bk
+    bk="$(_sockopt_backup)"
+    if helper sockopt-set --tcp-fast-open false; then
+        print_ok "已关闭 XrayR 侧 TFO (内核开关未改动)"
+        systemctl restart "${SERVICE_NAME}" 2>/dev/null
+        sleep 3
+        systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null && print_ok "服务正常"
+        echo "  回滚: ${bk}/restore.sh"
+    else
+        print_error "操作失败"
+    fi
+}
+
+_sockopt_remove() {
+    read -erp "  确认移除全部 SocketConfig, 回到默认行为? [y/N]: " ok
+    if [[ ! "$ok" =~ ^[Yy]$ ]]; then echo "  已取消"; return; fi
+    local bk
+    bk="$(_sockopt_backup)"
+    if helper sockopt-remove; then
+        print_ok "SocketConfig 已移除"
+        read -erp "  同时还原内核 TFO 开关? [y/N]: " k
+        if [[ "$k" =~ ^[Yy]$ ]]; then
+            rm -f "$SOCKOPT_SYSCTL_FILE"
+            sysctl -w net.ipv4.tcp_fastopen=1 >/dev/null 2>&1
+            print_ok "内核 TFO 已还原为 1 (系统默认)"
+        fi
+        systemctl restart "${SERVICE_NAME}" 2>/dev/null
+        sleep 3
+        systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null && print_ok "服务正常"
+        echo "  回滚: ${bk}/restore.sh"
+    else
+        print_error "操作失败"
+    fi
+}
+
 show_main_menu() {
     clear
     echo ""
@@ -1832,6 +2156,7 @@ show_main_menu() {
     echo -e "  ${YELLOW}14)${NC} GeoData 管理         ${YELLOW}15)${NC} 开启自启"
     echo -e "  ${YELLOW}16)${NC} 关闭自启             ${YELLOW}17)${NC} 查看版本"
     echo -e "  ${YELLOW}19)${NC} 日志大小限制         ${YELLOW}20)${NC} ${BOLD}更新管理${NC}"
+    echo -e "  ${YELLOW}21)${NC} 入站 Socket 调优"
     echo ""
     echo -e "  ${RED}${BOLD}─── 危险操作 ───${NC}"
     echo -e "  ${RED}18)${NC} 卸载 XrayR"
@@ -1843,7 +2168,7 @@ show_main_menu() {
 interactive_menu() {
     while true; do
         show_main_menu
-        read -erp "  请选择 [0-20]: " choice
+        read -erp "  请选择 [0-21]: " choice
         echo ""
         case "$choice" in
             1) do_start ;;
@@ -1866,6 +2191,7 @@ interactive_menu() {
             18) do_uninstall; exit 0 ;;
             19) menu_log_limit; continue ;;
             20) do_update_mgmt update-menu ;;
+            21) menu_sockopt; continue ;;
             0) exit 0 ;;
             *) print_error "无效选项" ;;
         esac
