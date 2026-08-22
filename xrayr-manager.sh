@@ -10,7 +10,7 @@ INSTALL_DIR="/usr/local/XrayR"
 HELPER="${INSTALL_DIR}/config_helper.py"
 
 # 管理脚本自身版本 (启动时按此比对远端, 有更新则静默升级)
-MGR_VERSION="1.3.0"
+MGR_VERSION="1.3.1"
 
 # 更新检查相关 (与 install.sh 保持一致)
 REPO="sdars/xrayr-release"
@@ -25,10 +25,36 @@ SERVICE_FILE=""
 BARE_PIDFILE="/var/run/xrayr.pid"
 BARE_LOGFILE="/var/log/xrayr.log"
 
+# 按 init 类型确定服务单元路径
+_init_set_service_file() {
+    case "$INIT_SYS" in
+        systemd) SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
+        *)       SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+    esac
+    return 0
+}
+
+# 在当前 shell(非子 shell)完成 init 探测并同步 SERVICE_FILE。
+# 必须用它而不是 $(detect_init), 否则 SERVICE_FILE 的赋值随子 shell 一起丢掉。
+init_ready() {
+    detect_init >/dev/null
+    return 0
+}
+
 detect_init() {
     if [[ -n "$INIT_SYS" ]]; then
         echo "$INIT_SYS"
         return 0
+    fi
+    # 允许用 XRAYR_INIT 强制指定, 用于容器测试或探测失误时人工纠正
+    if [[ -n "${XRAYR_INIT:-}" ]]; then
+        case "$XRAYR_INIT" in
+            systemd|openrc|sysvinit|procd|none)
+                INIT_SYS="$XRAYR_INIT"
+                _init_set_service_file
+                echo "$INIT_SYS"
+                return 0 ;;
+        esac
     fi
     if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
         INIT_SYS="systemd"
@@ -43,10 +69,7 @@ detect_init() {
     else
         INIT_SYS="none"
     fi
-    case "$INIT_SYS" in
-        systemd) SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
-        *)       SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
-    esac
+    _init_set_service_file
     echo "$INIT_SYS"
     return 0
 }
@@ -145,7 +168,13 @@ svc_enable() {
             elif command -v chkconfig >/dev/null 2>&1; then
                 chkconfig --add "$SERVICE_NAME" >/dev/null 2>&1; chkconfig "$SERVICE_NAME" on >/dev/null 2>&1
             fi ;;
-        procd)    "/etc/init.d/${SERVICE_NAME}" enable >/dev/null 2>&1 ;;
+        procd)
+            "/etc/init.d/${SERVICE_NAME}" enable >/dev/null 2>&1
+            # procd 环境不完整时上面会静默失败, 手工建 rc.d 链接兜底
+            if ! ls /etc/rc.d/S??"${SERVICE_NAME}" >/dev/null 2>&1; then
+                mkdir -p /etc/rc.d 2>/dev/null
+                ln -sf "/etc/init.d/${SERVICE_NAME}" "/etc/rc.d/S99${SERVICE_NAME}" 2>/dev/null
+            fi ;;
         *)        touch /etc/xrayr-bare-autostart ;;
     esac
     return $?
@@ -161,7 +190,9 @@ svc_disable() {
             elif command -v chkconfig >/dev/null 2>&1; then
                 chkconfig "$SERVICE_NAME" off >/dev/null 2>&1
             fi ;;
-        procd)    "/etc/init.d/${SERVICE_NAME}" disable >/dev/null 2>&1 ;;
+        procd)
+            "/etc/init.d/${SERVICE_NAME}" disable >/dev/null 2>&1
+            rm -f /etc/rc.d/S??"${SERVICE_NAME}" 2>/dev/null ;;
         *)        rm -f /etc/xrayr-bare-autostart ;;
     esac
     return $?

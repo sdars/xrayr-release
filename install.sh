@@ -29,7 +29,7 @@ COMMAND_LINK="/usr/local/bin/xrayr"
 
 # ==================== 版本与在线更新 ====================
 # 本安装脚本自身的版本号 (每次发布递增, 用于脚本自更新比对)
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 # 记录已安装的版本元数据 (二进制版本 / 脚本版本 / 安装时间 / 内嵌内核)
 VERSION_STATE_FILE="/etc/XrayR/.version"
 # 更新检查缓存 (避免频繁打 GitHub API), 单位秒
@@ -73,10 +73,41 @@ check_root() {
 # 目标: 同一套逻辑覆盖 systemd / OpenRC(Alpine,Gentoo) / SysVinit(老 Debian,CentOS6)
 #       / procd(OpenWrt)。所有服务操作统一走 svc_* 函数, 不再直接调 systemctl。
 
+# 按 init 类型确定服务单元路径
+_init_set_service_file() {
+    case "$INIT_SYS" in
+        systemd)  SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
+        openrc)   SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+        sysvinit) SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+        procd)    SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+        *)        SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
+    esac
+    return 0
+}
+
+# 在当前 shell(非子 shell)完成 init 探测并同步 SERVICE_FILE。
+# 必须用它而不是 $(detect_init), 否则 SERVICE_FILE 的赋值随子 shell 一起丢掉。
+init_ready() {
+    detect_init >/dev/null
+    return 0
+}
+
 detect_init() {
     if [[ -n "$INIT_SYS" ]]; then
         echo "$INIT_SYS"
         return 0
+    fi
+    # 允许用 XRAYR_INIT 强制指定, 用于容器测试或探测失误时人工纠正
+    if [[ -n "${XRAYR_INIT:-}" ]]; then
+        case "$XRAYR_INIT" in
+            systemd|openrc|sysvinit|procd|none)
+                INIT_SYS="$XRAYR_INIT"
+                _init_set_service_file
+                echo "$INIT_SYS"
+                return 0 ;;
+            *)
+                echo "XRAYR_INIT 取值非法: ${XRAYR_INIT} (可选 systemd/openrc/sysvinit/procd/none)" >&2 ;;
+        esac
     fi
     # 1) systemd: /run/systemd/system 存在且 systemctl 可用 (最可靠, 不看 PID1 名字)
     if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
@@ -97,13 +128,7 @@ detect_init() {
         INIT_SYS="none"
     fi
 
-    case "$INIT_SYS" in
-        systemd)  SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
-        openrc)   SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
-        sysvinit) SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
-        procd)    SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
-        *)        SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
-    esac
+    _init_set_service_file
     echo "$INIT_SYS"
     return 0
 }
@@ -166,7 +191,13 @@ svc_enable() {
                 chkconfig --add "$SERVICE_NAME" >/dev/null 2>&1
                 chkconfig "$SERVICE_NAME" on >/dev/null 2>&1
             fi ;;
-        procd)    "/etc/init.d/${SERVICE_NAME}" enable >/dev/null 2>&1 ;;
+        procd)
+            "/etc/init.d/${SERVICE_NAME}" enable >/dev/null 2>&1
+            # procd 环境不完整时上面会静默失败, 手工建 rc.d 链接兜底
+            if ! ls /etc/rc.d/S??"${SERVICE_NAME}" >/dev/null 2>&1; then
+                mkdir -p /etc/rc.d 2>/dev/null
+                ln -sf "/etc/init.d/${SERVICE_NAME}" "/etc/rc.d/S99${SERVICE_NAME}" 2>/dev/null
+            fi ;;
         *)        bare_enable ;;
     esac
     return $?
@@ -182,7 +213,9 @@ svc_disable() {
             elif command -v chkconfig >/dev/null 2>&1; then
                 chkconfig "$SERVICE_NAME" off >/dev/null 2>&1
             fi ;;
-        procd)    "/etc/init.d/${SERVICE_NAME}" disable >/dev/null 2>&1 ;;
+        procd)
+            "/etc/init.d/${SERVICE_NAME}" disable >/dev/null 2>&1
+            rm -f /etc/rc.d/S??"${SERVICE_NAME}" 2>/dev/null ;;
         *)        bare_disable ;;
     esac
     return $?
@@ -208,7 +241,7 @@ svc_is_enabled() {
         systemd)  systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; return $? ;;
         openrc)   rc-update show default 2>/dev/null | grep -q "^\s*${SERVICE_NAME}\b"; return $? ;;
         sysvinit) ls /etc/rc[2-5].d/S??"${SERVICE_NAME}" >/dev/null 2>&1; return $? ;;
-        procd)    [[ -f "/etc/rc.d/S??${SERVICE_NAME}" ]] || ls /etc/rc.d/S??"${SERVICE_NAME}" >/dev/null 2>&1; return $? ;;
+        procd)    ls /etc/rc.d/S??"${SERVICE_NAME}" >/dev/null 2>&1; return $? ;;
         *)        [[ -f /etc/xrayr-bare-autostart ]]; return $? ;;
     esac
 }
@@ -1939,6 +1972,7 @@ GEOCONFEOF
 # ==================== 服务单元安装 (多 init 系统) ====================
 # install_systemd_service 保留旧名作为统一入口, 内部按 init 系统分派。
 install_systemd_service() {
+    init_ready
     local it
     it="$(detect_init)"
     case "$it" in
@@ -2832,6 +2866,18 @@ is_installed() {
 }
 
 svc_state() {
+    init_ready
+    # 裸进程模式不写服务单元, 只能看二进制是否装了 + 进程是否在
+    if [[ "$(detect_init)" == "none" ]]; then
+        if [[ ! -x "${INSTALL_DIR}/XrayR" ]]; then
+            echo "none"
+        elif svc_is_active; then
+            echo "running"
+        else
+            echo "stopped"
+        fi
+        return 0
+    fi
     if [[ ! -f "$SERVICE_FILE" ]]; then
         echo "none"
         return 0
@@ -3179,6 +3225,7 @@ do_upgrade() {
 
 do_uninstall() {
     check_root
+    init_ready
     if ! is_installed && [[ ! -f "$SERVICE_FILE" ]]; then
         print_error "XrayR 未安装, 无需卸载"
         return 1
