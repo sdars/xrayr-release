@@ -10,13 +10,208 @@ INSTALL_DIR="/usr/local/XrayR"
 HELPER="${INSTALL_DIR}/config_helper.py"
 
 # 管理脚本自身版本 (启动时按此比对远端, 有更新则静默升级)
-MGR_VERSION="1.2.1"
+MGR_VERSION="1.3.0"
 
 # 更新检查相关 (与 install.sh 保持一致)
 REPO="sdars/xrayr-release"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 UPDATE_CACHE_FILE="/var/lib/.xrayr-update-cache"
 UPDATE_CACHE_TTL=3600
+
+# ==================== init 系统抽象层 ====================
+# 与 install.sh 同源逻辑, 覆盖 systemd / OpenRC / SysVinit / procd / 无 init。
+INIT_SYS=""
+SERVICE_FILE=""
+BARE_PIDFILE="/var/run/xrayr.pid"
+BARE_LOGFILE="/var/log/xrayr.log"
+
+detect_init() {
+    if [[ -n "$INIT_SYS" ]]; then
+        echo "$INIT_SYS"
+        return 0
+    fi
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        INIT_SYS="systemd"
+    elif [[ -f /etc/rc.common ]] && ( [[ -x /sbin/procd ]] || grep -qi openwrt /etc/os-release 2>/dev/null ); then
+        INIT_SYS="procd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYS="openrc"
+    elif [[ -d /etc/init.d ]] && ( command -v service >/dev/null 2>&1 || command -v update-rc.d >/dev/null 2>&1 || command -v chkconfig >/dev/null 2>&1 ); then
+        INIT_SYS="sysvinit"
+    elif command -v systemctl >/dev/null 2>&1; then
+        INIT_SYS="systemd"
+    else
+        INIT_SYS="none"
+    fi
+    case "$INIT_SYS" in
+        systemd) SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
+        *)       SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+    esac
+    echo "$INIT_SYS"
+    return 0
+}
+
+init_desc() {
+    case "$(detect_init)" in
+        systemd)  echo "systemd" ;;
+        openrc)   echo "OpenRC" ;;
+        sysvinit) echo "SysVinit" ;;
+        procd)    echo "procd (OpenWrt)" ;;
+        *)        echo "无 (裸进程)" ;;
+    esac
+    return 0
+}
+
+svc_is_active() {
+    case "$(detect_init)" in
+        systemd) systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; return $? ;;
+        openrc)  rc-service "$SERVICE_NAME" status 2>/dev/null | grep -qE "status: started|已启动"; return $? ;;
+        *)       pgrep -f "${INSTALL_DIR}/XrayR" >/dev/null 2>&1; return $? ;;
+    esac
+}
+
+svc_is_enabled() {
+    case "$(detect_init)" in
+        systemd)  systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; return $? ;;
+        openrc)   rc-update show default 2>/dev/null | grep -q "${SERVICE_NAME}"; return $? ;;
+        sysvinit) ls /etc/rc[2-5].d/S??"${SERVICE_NAME}" >/dev/null 2>&1; return $? ;;
+        procd)    ls /etc/rc.d/S??"${SERVICE_NAME}" >/dev/null 2>&1; return $? ;;
+        *)        [[ -f /etc/xrayr-bare-autostart ]]; return $? ;;
+    esac
+}
+
+_bare_start() {
+    if svc_is_active; then return 0; fi
+    mkdir -p "$(dirname "$BARE_LOGFILE")" 2>/dev/null
+    setsid nohup "${INSTALL_DIR}/XrayR" --config "${CONFIG_DIR}/config.yml" \
+        >> "$BARE_LOGFILE" 2>&1 < /dev/null &
+    echo $! > "$BARE_PIDFILE" 2>/dev/null
+    sleep 1
+    svc_is_active
+    return $?
+}
+
+_bare_stop() {
+    local p
+    if [[ -f "$BARE_PIDFILE" ]]; then
+        p="$(cat "$BARE_PIDFILE" 2>/dev/null)"
+        if [[ -n "$p" ]]; then kill "$p" 2>/dev/null; fi
+    fi
+    pkill -f "${INSTALL_DIR}/XrayR --config" 2>/dev/null
+    rm -f "$BARE_PIDFILE" 2>/dev/null
+    return 0
+}
+
+svc_start() {
+    case "$(detect_init)" in
+        systemd)  systemctl start "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-service "$SERVICE_NAME" start >/dev/null 2>&1 ;;
+        sysvinit) if command -v service >/dev/null 2>&1; then service "$SERVICE_NAME" start >/dev/null 2>&1; else "/etc/init.d/${SERVICE_NAME}" start >/dev/null 2>&1; fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" start >/dev/null 2>&1 ;;
+        *)        _bare_start ;;
+    esac
+    return $?
+}
+
+svc_stop() {
+    case "$(detect_init)" in
+        systemd)  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 ;;
+        sysvinit) if command -v service >/dev/null 2>&1; then service "$SERVICE_NAME" stop >/dev/null 2>&1; else "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1; fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1 ;;
+        *)        _bare_stop ;;
+    esac
+    return $?
+}
+
+svc_restart() {
+    case "$(detect_init)" in
+        systemd)  systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 ;;
+        sysvinit) if command -v service >/dev/null 2>&1; then service "$SERVICE_NAME" restart >/dev/null 2>&1; else "/etc/init.d/${SERVICE_NAME}" restart >/dev/null 2>&1; fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" restart >/dev/null 2>&1 ;;
+        *)        _bare_stop; sleep 1; _bare_start ;;
+    esac
+    return $?
+}
+
+svc_enable() {
+    case "$(detect_init)" in
+        systemd)  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 ;;
+        sysvinit)
+            if command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d "$SERVICE_NAME" defaults >/dev/null 2>&1
+            elif command -v chkconfig >/dev/null 2>&1; then
+                chkconfig --add "$SERVICE_NAME" >/dev/null 2>&1; chkconfig "$SERVICE_NAME" on >/dev/null 2>&1
+            fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" enable >/dev/null 2>&1 ;;
+        *)        touch /etc/xrayr-bare-autostart ;;
+    esac
+    return $?
+}
+
+svc_disable() {
+    case "$(detect_init)" in
+        systemd)  systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 ;;
+        sysvinit)
+            if command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d -f "$SERVICE_NAME" remove >/dev/null 2>&1
+            elif command -v chkconfig >/dev/null 2>&1; then
+                chkconfig "$SERVICE_NAME" off >/dev/null 2>&1
+            fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" disable >/dev/null 2>&1 ;;
+        *)        rm -f /etc/xrayr-bare-autostart ;;
+    esac
+    return $?
+}
+
+svc_daemon_reload() {
+    if [[ "$(detect_init)" == "systemd" ]]; then
+        systemctl daemon-reload >/dev/null 2>&1
+    fi
+    return 0
+}
+
+svc_status_text() {
+    case "$(detect_init)" in
+        systemd) systemctl status "$SERVICE_NAME" --no-pager 2>/dev/null || true ;;
+        openrc)  rc-service "$SERVICE_NAME" status 2>&1 | head -20 ;;
+        *)
+            if svc_is_active; then
+                echo "  运行状态: 运行中"
+                pgrep -af "${INSTALL_DIR}/XrayR" 2>/dev/null | head -5
+            else
+                echo "  运行状态: 已停止"
+            fi ;;
+    esac
+    return 0
+}
+
+# 日志: systemd 走 journalctl, 其余走文件
+svc_log_tail() {
+    local n="${1:-50}"
+    if [[ "$(detect_init)" == "systemd" ]]; then
+        journalctl -u "$SERVICE_NAME" --no-pager -n "$n" 2>&1
+    elif [[ -f "$BARE_LOGFILE" ]]; then
+        tail -n "$n" "$BARE_LOGFILE"
+    else
+        echo "  未找到日志 (${BARE_LOGFILE} 不存在)"
+    fi
+    return 0
+}
+
+svc_log_follow() {
+    if [[ "$(detect_init)" == "systemd" ]]; then
+        journalctl -u "$SERVICE_NAME" --no-pager -f
+    elif [[ -f "$BARE_LOGFILE" ]]; then
+        tail -f "$BARE_LOGFILE"
+    else
+        echo "  未找到日志 (${BARE_LOGFILE} 不存在)"
+    fi
+    return 0
+}
 
 # 按显示宽度补齐 (中文占 2 列, UTF-8 占 3 字节, printf %-Ns 会错位)
 pad_disp() {
@@ -172,13 +367,13 @@ helper() {
 
 show_status() {
     local status
-    if systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null; then
+    if svc_is_active; then
         status="${GREEN}● 运行中${NC}"
     else
         status="${RED}○ 已停止${NC}"
     fi
     local enabled
-    if systemctl is-enabled --quiet ${SERVICE_NAME} 2>/dev/null; then
+    if svc_is_enabled; then
         enabled="${GREEN}已启用${NC}"
     else
         enabled="${RED}未启用${NC}"
@@ -192,51 +387,53 @@ show_status() {
 # ========== 服务控制 ==========
 do_start() {
     print_info "正在启动 XrayR..."
-    systemctl start ${SERVICE_NAME}
+    svc_start
     sleep 1
-    if systemctl is-active --quiet ${SERVICE_NAME}; then
+    if svc_is_active; then
         print_ok "XrayR 启动成功"
     else
         print_error "XrayR 启动失败"
-        journalctl -u ${SERVICE_NAME} --no-pager -n 10
+        svc_log_tail 10
         return 1
     fi
 }
 do_stop() {
     print_info "正在停止 XrayR..."
-    systemctl stop ${SERVICE_NAME}
+    svc_stop
     print_ok "XrayR 已停止"
 }
 do_restart() {
     print_info "正在重启 XrayR..."
-    systemctl restart ${SERVICE_NAME}
+    svc_restart
     sleep 1
-    if systemctl is-active --quiet ${SERVICE_NAME}; then
+    if svc_is_active; then
         print_ok "XrayR 重启成功"
     else
         print_error "XrayR 重启失败"
-        journalctl -u ${SERVICE_NAME} --no-pager -n 10
+        svc_log_tail 10
         return 1
     fi
 }
 do_status() {
     show_status
     echo ""
-    systemctl status ${SERVICE_NAME} --no-pager 2>/dev/null || true
+    echo -e " ${BOLD}init 系统${NC}: $(init_desc)"
+    echo ""
+    svc_status_text
 }
 do_log() {
     echo -e "${CYAN}正在查看实时日志 (Ctrl+C 退出)...${NC}"
-    journalctl -u ${SERVICE_NAME} --no-pager -f
+    svc_log_follow
 }
 do_log_recent() {
-    journalctl -u ${SERVICE_NAME} --no-pager -n 50
+    svc_log_tail 50
 }
 do_enable() {
-    systemctl enable ${SERVICE_NAME} 2>/dev/null
+    svc_enable
     print_ok "已开启开机自启"
 }
 do_disable() {
-    systemctl disable ${SERVICE_NAME} 2>/dev/null
+    svc_disable
     print_ok "已关闭开机自启"
 }
 do_version() {
@@ -1374,7 +1571,7 @@ do_update_geodata() {
     _geo_download_one "$_GEO_SITE" "${CONFIG_DIR}/geosite.dat" "geosite.dat" && updated=1
     if [[ $updated -eq 1 && "$GEO_AUTO_RESTART" == "true" ]]; then
         print_info "正在重启 XrayR..."
-        systemctl restart ${SERVICE_NAME} 2>/dev/null && print_ok "服务已重启" || print_error "重启失败"
+        if svc_restart; then print_ok "服务已重启"; else print_error "重启失败"; fi
     fi
 }
 
@@ -1508,7 +1705,7 @@ if [[ $rc -eq 0 ]]; then updated=1; fi
 if [[ $rc -eq 1 ]]; then failed=1; fi
 
 if [[ $updated -eq 1 ]] && [[ "$GEO_AUTO_RESTART" == "true" ]]; then
-    if systemctl restart "$SERVICE_NAME" 2>/dev/null; then
+    if svc_restart; then
         log "XrayR 已重启以加载新规则"
     else
         log "ERROR: XrayR 重启失败"
@@ -1714,10 +1911,10 @@ do_uninstall() {
         *) echo "已取消"; return ;;
     esac
     print_info "正在停止服务..."
-    systemctl stop ${SERVICE_NAME} 2>/dev/null || true
-    systemctl disable ${SERVICE_NAME} 2>/dev/null || true
+    svc_stop
+    svc_disable
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
+    svc_daemon_reload
     rm -rf "${INSTALL_DIR}"
     rm -f "/usr/bin/xrayr"
     read -erp "是否删除配置文件 (${CONFIG_DIR})? [y/N]: " rm_config
@@ -1740,7 +1937,7 @@ _show_log_status() {
     printf "    %-32s %-10s %s\n" "日志文件" "大小" "限制/轮转"
     printf "    %-32s %-10s %s\n" "--------------------------------" "----------" "--------------------------------"
     local ju
-    ju=$(journalctl -u "${SERVICE_NAME}" --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMG]?' | head -1)
+    if [[ "$(detect_init)" == "systemd" ]]; then ju=$(journalctl -u "${SERVICE_NAME}" --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMG]?' | head -1); else ju=""; fi
     local jlim="未限制 (系统默认)"
     if [[ -f "$JOURNALD_LIMIT_FILE" ]]; then
         jlim=$(grep -E '^SystemMaxUse' "$JOURNALD_LIMIT_FILE" | cut -d= -f2)
@@ -1766,7 +1963,7 @@ _show_log_status() {
     echo ""
     echo -e "  ${BOLD}journald 全局:${NC}"
     local jtotal
-    jtotal=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMG]?[Bb]?' | head -1)
+    if [[ "$(detect_init)" == "systemd" ]]; then jtotal=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMG]?[Bb]?' | head -1); else jtotal=""; fi
     echo "    磁盘占用: ${jtotal:-N/A}"
     if [[ -f "$JOURNALD_LIMIT_FILE" ]]; then
         grep -E '^(SystemMaxUse|SystemMaxFileSize|MaxRetentionSec)' "$JOURNALD_LIMIT_FILE" | sed 's/^/    /'
@@ -1814,7 +2011,7 @@ MaxRetentionSec=${j_ret}
 RateLimitIntervalSec=30s
 RateLimitBurst=10000
 JEOF
-    systemctl restart systemd-journald 2>/dev/null || true
+    if [[ "$(detect_init)" == "systemd" ]]; then systemctl restart systemd-journald 2>/dev/null || true; fi
     logrotate -d "$LOGROTATE_FILE" &>/dev/null && print_ok "日志限制已更新" || print_warn "logrotate 规则 dry-run 有告警"
 }
 
@@ -1830,7 +2027,7 @@ _run_logrotate_now() {
 _purge_journal() {
     read -erp "  保留最近多少天的 journald 日志? [7]: " days
     days="${days:-7}"
-    journalctl --vacuum-time=${days}d 2>&1 | tail -5
+    if [[ "$(detect_init)" == "systemd" ]]; then journalctl --vacuum-time=${days}d 2>&1 | tail -5; else echo "  非 systemd 系统, 无 journal 可清理"; fi
     print_ok "journald 已清理 (保留 ${days} 天)"
 }
 
@@ -1865,7 +2062,7 @@ menu_log_limit() {
             4) _purge_journal; read -erp "  按回车继续..." _ ;;
             5)
                 rm -f "$LOGROTATE_FILE" "$JOURNALD_LIMIT_FILE"
-                systemctl restart systemd-journald 2>/dev/null || true
+                if [[ "$(detect_init)" == "systemd" ]]; then systemctl restart systemd-journald 2>/dev/null || true; fi
                 print_ok "XrayR 日志限制已卸载"
                 read -erp "  按回车继续..." _ ;;
             0|q) return ;;
@@ -1962,7 +2159,7 @@ _sockopt_backup() {
     {
         echo '#!/bin/bash'
         echo '# 回滚入站 Socket 调优到本次修改之前的状态'
-        echo "systemctl stop XrayR 2>/dev/null"
+        echo "if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl stop XrayR 2>/dev/null; elif command -v rc-service >/dev/null 2>&1; then rc-service XrayR stop 2>/dev/null; elif [ -x /etc/init.d/XrayR ]; then /etc/init.d/XrayR stop 2>/dev/null; else pkill -f '/usr/local/XrayR/XrayR --config' 2>/dev/null; fi"
         echo "cp -f '${bk}/config.yml' '${CONFIG_DIR}/config.yml'"
         echo "sysctl -w net.ipv4.tcp_fastopen=\$(cat '${bk}/tcp_fastopen.val') >/dev/null"
         if [[ -f "${bk}/99-xrayr-tfo.conf" ]]; then
@@ -1970,9 +2167,9 @@ _sockopt_backup() {
         else
             echo "rm -f '${SOCKOPT_SYSCTL_FILE}'"
         fi
-        echo "systemctl start XrayR 2>/dev/null"
+        echo "if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then systemctl start XrayR 2>/dev/null; elif command -v rc-service >/dev/null 2>&1; then rc-service XrayR start 2>/dev/null; elif [ -x /etc/init.d/XrayR ]; then /etc/init.d/XrayR start 2>/dev/null; else setsid nohup /usr/local/XrayR/XrayR --config /etc/XrayR/config.yml >> /var/log/xrayr.log 2>&1 < /dev/null & fi"
         echo "sleep 2"
-        echo "echo '已回滚, 服务状态: '\$(systemctl is-active XrayR)"
+        echo "if pgrep -f '/usr/local/XrayR/XrayR --config' >/dev/null 2>&1; then echo '已回滚, 服务状态: 运行中'; else echo '已回滚, 服务状态: 已停止'; fi"
     } > "${bk}/restore.sh"
     chmod +x "${bk}/restore.sh"
     echo "$bk"
@@ -2090,9 +2287,9 @@ _sockopt_enable_all() {
 
     echo ""
     print_info "重启服务..."
-    systemctl restart "${SERVICE_NAME}" 2>/dev/null
+    svc_restart
     sleep 4
-    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+    if svc_is_active; then
         print_ok "服务运行正常"
         echo ""
         echo "  验证方式: 让客户端连接后回到本菜单查看"
@@ -2147,9 +2344,9 @@ _sockopt_edit() {
         print_ok "已写入, 备份: ${bk}"
         read -erp "  立即重启服务生效? [Y/n]: " r
         if [[ ! "$r" =~ ^[Nn]$ ]]; then
-            systemctl restart "${SERVICE_NAME}" 2>/dev/null
+            svc_restart
             sleep 3
-            if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+            if svc_is_active; then
                 print_ok "服务运行正常"
             else
                 print_error "启动失败, 自动回滚"
@@ -2166,9 +2363,9 @@ _sockopt_disable_tfo() {
     bk="$(_sockopt_backup)"
     if helper sockopt-set --tcp-fast-open false; then
         print_ok "已关闭 XrayR 侧 TFO (内核开关未改动)"
-        systemctl restart "${SERVICE_NAME}" 2>/dev/null
+        svc_restart
         sleep 3
-        systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null && print_ok "服务正常"
+        if svc_is_active; then print_ok "服务正常"; fi
         echo "  回滚: ${bk}/restore.sh"
     else
         print_error "操作失败"
@@ -2188,9 +2385,9 @@ _sockopt_remove() {
             sysctl -w net.ipv4.tcp_fastopen=1 >/dev/null 2>&1
             print_ok "内核 TFO 已还原为 1 (系统默认)"
         fi
-        systemctl restart "${SERVICE_NAME}" 2>/dev/null
+        svc_restart
         sleep 3
-        systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null && print_ok "服务正常"
+        if svc_is_active; then print_ok "服务正常"; fi
         echo "  回滚: ${bk}/restore.sh"
     else
         print_error "操作失败"

@@ -21,12 +21,15 @@ REPO="sdars/xrayr-release"
 INSTALL_DIR="/usr/local/XrayR"
 CONFIG_DIR="/etc/XrayR"
 SERVICE_NAME="XrayR"
+# 服务单元路径由 init 系统决定, 在 detect_init() 中最终确定
 SERVICE_FILE="/etc/systemd/system/XrayR.service"
+# 当前 init 系统: systemd / openrc / sysvinit / procd / none
+INIT_SYS=""
 COMMAND_LINK="/usr/local/bin/xrayr"
 
 # ==================== 版本与在线更新 ====================
 # 本安装脚本自身的版本号 (每次发布递增, 用于脚本自更新比对)
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.3.0"
 # 记录已安装的版本元数据 (二进制版本 / 脚本版本 / 安装时间 / 内嵌内核)
 VERSION_STATE_FILE="/etc/XrayR/.version"
 # 更新检查缓存 (避免频繁打 GitHub API), 单位秒
@@ -66,26 +69,414 @@ check_root() {
     return 0
 }
 
+# ==================== init 系统抽象层 ====================
+# 目标: 同一套逻辑覆盖 systemd / OpenRC(Alpine,Gentoo) / SysVinit(老 Debian,CentOS6)
+#       / procd(OpenWrt)。所有服务操作统一走 svc_* 函数, 不再直接调 systemctl。
+
+detect_init() {
+    if [[ -n "$INIT_SYS" ]]; then
+        echo "$INIT_SYS"
+        return 0
+    fi
+    # 1) systemd: /run/systemd/system 存在且 systemctl 可用 (最可靠, 不看 PID1 名字)
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        INIT_SYS="systemd"
+    # 2) procd (OpenWrt): 有 /etc/rc.common 与 procd 二进制
+    elif [[ -f /etc/rc.common ]] && ( [[ -x /sbin/procd ]] || grep -qi openwrt /etc/os-release 2>/dev/null ); then
+        INIT_SYS="procd"
+    # 3) OpenRC: rc-service / rc-update 存在
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYS="openrc"
+    # 4) SysVinit: /etc/init.d 可写 + service 或 update-rc.d/chkconfig
+    elif [[ -d /etc/init.d ]] && ( command -v service >/dev/null 2>&1 || command -v update-rc.d >/dev/null 2>&1 || command -v chkconfig >/dev/null 2>&1 ); then
+        INIT_SYS="sysvinit"
+    # 5) 兜底: systemctl 存在但没有 /run/systemd (容器里常见), 仍按 systemd 试
+    elif command -v systemctl >/dev/null 2>&1; then
+        INIT_SYS="systemd"
+    else
+        INIT_SYS="none"
+    fi
+
+    case "$INIT_SYS" in
+        systemd)  SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
+        openrc)   SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+        sysvinit) SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+        procd)    SERVICE_FILE="/etc/init.d/${SERVICE_NAME}" ;;
+        *)        SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service" ;;
+    esac
+    echo "$INIT_SYS"
+    return 0
+}
+
+init_desc() {
+    case "$(detect_init)" in
+        systemd)  echo "systemd" ;;
+        openrc)   echo "OpenRC" ;;
+        sysvinit) echo "SysVinit" ;;
+        procd)    echo "procd (OpenWrt)" ;;
+        *)        echo "无 (裸进程管理)" ;;
+    esac
+    return 0
+}
+
+# 无 init 系统时的 PID 文件 (裸进程守护模式)
+BARE_PIDFILE="/var/run/xrayr.pid"
+
+svc_start() {
+    case "$(detect_init)" in
+        systemd)  systemctl start "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-service "$SERVICE_NAME" start >/dev/null 2>&1 ;;
+        sysvinit) if command -v service >/dev/null 2>&1; then service "$SERVICE_NAME" start >/dev/null 2>&1; else "/etc/init.d/${SERVICE_NAME}" start >/dev/null 2>&1; fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" start >/dev/null 2>&1 ;;
+        *)        bare_start ;;
+    esac
+    return $?
+}
+
+svc_stop() {
+    case "$(detect_init)" in
+        systemd)  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 ;;
+        sysvinit) if command -v service >/dev/null 2>&1; then service "$SERVICE_NAME" stop >/dev/null 2>&1; else "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1; fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1 ;;
+        *)        bare_stop ;;
+    esac
+    return $?
+}
+
+svc_restart() {
+    case "$(detect_init)" in
+        systemd)  systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 ;;
+        sysvinit) if command -v service >/dev/null 2>&1; then service "$SERVICE_NAME" restart >/dev/null 2>&1; else "/etc/init.d/${SERVICE_NAME}" restart >/dev/null 2>&1; fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" restart >/dev/null 2>&1 ;;
+        *)        bare_stop; sleep 1; bare_start ;;
+    esac
+    return $?
+}
+
+svc_enable() {
+    case "$(detect_init)" in
+        systemd)  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 ;;
+        sysvinit)
+            if command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d "$SERVICE_NAME" defaults >/dev/null 2>&1
+            elif command -v chkconfig >/dev/null 2>&1; then
+                chkconfig --add "$SERVICE_NAME" >/dev/null 2>&1
+                chkconfig "$SERVICE_NAME" on >/dev/null 2>&1
+            fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" enable >/dev/null 2>&1 ;;
+        *)        bare_enable ;;
+    esac
+    return $?
+}
+
+svc_disable() {
+    case "$(detect_init)" in
+        systemd)  systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 ;;
+        openrc)   rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 ;;
+        sysvinit)
+            if command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d -f "$SERVICE_NAME" remove >/dev/null 2>&1
+            elif command -v chkconfig >/dev/null 2>&1; then
+                chkconfig "$SERVICE_NAME" off >/dev/null 2>&1
+            fi ;;
+        procd)    "/etc/init.d/${SERVICE_NAME}" disable >/dev/null 2>&1 ;;
+        *)        bare_disable ;;
+    esac
+    return $?
+}
+
+# 服务是否在运行 (返回 0=运行中)
+svc_is_active() {
+    case "$(detect_init)" in
+        systemd)  systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; return $? ;;
+        openrc)   rc-service "$SERVICE_NAME" status 2>/dev/null | grep -qE "status: started|已启动"; return $? ;;
+        sysvinit|procd)
+            if pgrep -f "${INSTALL_DIR}/XrayR" >/dev/null 2>&1; then return 0; fi
+            return 1 ;;
+        *)
+            if pgrep -f "${INSTALL_DIR}/XrayR" >/dev/null 2>&1; then return 0; fi
+            return 1 ;;
+    esac
+}
+
+# 是否开机自启 (返回 0=已启用)
+svc_is_enabled() {
+    case "$(detect_init)" in
+        systemd)  systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; return $? ;;
+        openrc)   rc-update show default 2>/dev/null | grep -q "^\s*${SERVICE_NAME}\b"; return $? ;;
+        sysvinit) ls /etc/rc[2-5].d/S??"${SERVICE_NAME}" >/dev/null 2>&1; return $? ;;
+        procd)    [[ -f "/etc/rc.d/S??${SERVICE_NAME}" ]] || ls /etc/rc.d/S??"${SERVICE_NAME}" >/dev/null 2>&1; return $? ;;
+        *)        [[ -f /etc/xrayr-bare-autostart ]]; return $? ;;
+    esac
+}
+
+# 重载 init 配置 (仅 systemd 需要)
+svc_daemon_reload() {
+    if [[ "$(detect_init)" == "systemd" ]]; then
+        systemctl daemon-reload >/dev/null 2>&1
+    fi
+    return 0
+}
+
+# 服务状态文本 (人读)
+svc_status_text() {
+    case "$(detect_init)" in
+        systemd)  systemctl status "$SERVICE_NAME" --no-pager -l 2>&1 | head -30 ;;
+        openrc)   rc-service "$SERVICE_NAME" status 2>&1 | head -20 ;;
+        *)
+            if svc_is_active; then
+                echo "  运行状态: 运行中"
+                pgrep -af "${INSTALL_DIR}/XrayR" 2>/dev/null | head -5
+            else
+                echo "  运行状态: 已停止"
+            fi ;;
+    esac
+    return 0
+}
+
+# 查看日志。systemd 走 journalctl, 其余走文件日志。
+BARE_LOGFILE="/var/log/xrayr.log"
+svc_log_tail() {
+    local n="${1:-50}"
+    if [[ "$(detect_init)" == "systemd" ]]; then
+        journalctl -u "$SERVICE_NAME" -n "$n" --no-pager 2>&1 | tail -"$n"
+    elif [[ -f "$BARE_LOGFILE" ]]; then
+        tail -n "$n" "$BARE_LOGFILE"
+    else
+        echo "  未找到日志 (${BARE_LOGFILE} 不存在)"
+    fi
+    return 0
+}
+
+svc_log_follow() {
+    if [[ "$(detect_init)" == "systemd" ]]; then
+        journalctl -u "$SERVICE_NAME" -f --no-pager
+    elif [[ -f "$BARE_LOGFILE" ]]; then
+        tail -f "$BARE_LOGFILE"
+    else
+        echo "  未找到日志 (${BARE_LOGFILE} 不存在)"
+    fi
+    return 0
+}
+
+# ---------- 裸进程守护 (无 init 系统时) ----------
+bare_start() {
+    if svc_is_active; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$BARE_LOGFILE")" 2>/dev/null
+    setsid nohup "${INSTALL_DIR}/XrayR" --config "${CONFIG_DIR}/config.yml" \
+        >> "$BARE_LOGFILE" 2>&1 < /dev/null &
+    echo $! > "$BARE_PIDFILE" 2>/dev/null
+    sleep 1
+    svc_is_active
+    return $?
+}
+
+bare_stop() {
+    local p
+    if [[ -f "$BARE_PIDFILE" ]]; then
+        p="$(cat "$BARE_PIDFILE" 2>/dev/null)"
+        if [[ -n "$p" ]]; then
+            kill "$p" 2>/dev/null
+        fi
+    fi
+    pkill -f "${INSTALL_DIR}/XrayR --config" 2>/dev/null
+    rm -f "$BARE_PIDFILE" 2>/dev/null
+    return 0
+}
+
+# 无 init 时用 cron @reboot 实现开机自启
+bare_enable() {
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v "xrayr-bare-boot"; \
+         echo "@reboot ${INSTALL_DIR}/xrayr-bare-boot.sh >/dev/null 2>&1 # xrayr-bare-boot") | crontab -
+    fi
+    cat > "${INSTALL_DIR}/xrayr-bare-boot.sh" <<BAREEOF
+#!/bin/sh
+sleep 5
+exec ${INSTALL_DIR}/XrayR --config ${CONFIG_DIR}/config.yml >> ${BARE_LOGFILE} 2>&1
+BAREEOF
+    chmod +x "${INSTALL_DIR}/xrayr-bare-boot.sh"
+    touch /etc/xrayr-bare-autostart
+    return 0
+}
+
+bare_disable() {
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v "xrayr-bare-boot" | crontab - >/dev/null 2>&1
+    fi
+    rm -f /etc/xrayr-bare-autostart
+    return 0
+}
+
+# 尝试启用 cron 守护 (跨 init 系统)。成功返回 0。
+_try_enable_cron_svc() {
+    local svc="$1"
+    case "$(detect_init)" in
+        systemd)
+            if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
+                systemctl enable --now "$svc" >/dev/null 2>&1
+                return 0
+            fi
+            return 1 ;;
+        openrc)
+            if [[ -f "/etc/init.d/$svc" ]]; then
+                rc-update add "$svc" default >/dev/null 2>&1
+                rc-service "$svc" start >/dev/null 2>&1
+                return 0
+            fi
+            return 1 ;;
+        sysvinit|procd)
+            if [[ -f "/etc/init.d/$svc" ]]; then
+                if command -v update-rc.d >/dev/null 2>&1; then
+                    update-rc.d "$svc" defaults >/dev/null 2>&1
+                elif command -v chkconfig >/dev/null 2>&1; then
+                    chkconfig "$svc" on >/dev/null 2>&1
+                fi
+                "/etc/init.d/$svc" start >/dev/null 2>&1
+                return 0
+            fi
+            return 1 ;;
+        *)
+            # 无 init: 直接尝试拉起 crond 前台守护
+            if command -v crond >/dev/null 2>&1 && ! pgrep -x crond >/dev/null 2>&1; then
+                setsid nohup crond >/dev/null 2>&1 < /dev/null &
+                return 0
+            fi
+            return 1 ;;
+    esac
+}
+
+
+
 # ==================== 依赖管理 ====================
 PKG_MGR=""
 PKG_UPDATED=0
 
 detect_pkg_mgr() {
-    if command -v apt-get >/dev/null 2>&1; then
+    # 顺序有讲究: opkg/apk 要优先于通用判断, 避免 OpenWrt 上误判
+    if command -v opkg >/dev/null 2>&1; then
+        PKG_MGR="opkg"
+    elif command -v apk >/dev/null 2>&1; then
+        PKG_MGR="apk"
+    elif command -v apt-get >/dev/null 2>&1; then
         PKG_MGR="apt"
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MGR="dnf"
     elif command -v yum >/dev/null 2>&1; then
         PKG_MGR="yum"
-    elif command -v apk >/dev/null 2>&1; then
-        PKG_MGR="apk"
-    elif command -v pacman >/dev/null 2>&1; then
-        PKG_MGR="pacman"
     elif command -v zypper >/dev/null 2>&1; then
         PKG_MGR="zypper"
+    elif command -v pacman >/dev/null 2>&1; then
+        PKG_MGR="pacman"
+    elif command -v xbps-install >/dev/null 2>&1; then
+        PKG_MGR="xbps"
+    elif command -v emerge >/dev/null 2>&1; then
+        PKG_MGR="emerge"
+    elif command -v swupd >/dev/null 2>&1; then
+        PKG_MGR="swupd"
+    elif command -v eopkg >/dev/null 2>&1; then
+        PKG_MGR="eopkg"
+    elif command -v urpmi >/dev/null 2>&1; then
+        PKG_MGR="urpmi"
+    elif command -v slackpkg >/dev/null 2>&1; then
+        PKG_MGR="slackpkg"
+    elif command -v nix-env >/dev/null 2>&1; then
+        PKG_MGR="nix"
     else
         PKG_MGR=""
     fi
+    return 0
+}
+
+# 包管理器中文名, 用于安装时展示
+# 回显包管理器名称(供 $(...) 取值用; detect_pkg_mgr 只设变量不输出)
+pkg_mgr_name() {
+    detect_pkg_mgr
+    echo "${PKG_MGR}"
+    return 0
+}
+
+pkg_mgr_desc() {
+    case "${1:-$PKG_MGR}" in
+        apt)      echo "apt (Debian/Ubuntu 系)" ;;
+        dnf)      echo "dnf (Fedora/RHEL9+)" ;;
+        yum)      echo "yum (CentOS/RHEL7-8)" ;;
+        apk)      echo "apk (Alpine)" ;;
+        pacman)   echo "pacman (Arch/Manjaro)" ;;
+        zypper)   echo "zypper (openSUSE/SLES)" ;;
+        opkg)     echo "opkg (OpenWrt/LEDE)" ;;
+        xbps)     echo "xbps (Void Linux)" ;;
+        emerge)   echo "emerge (Gentoo)" ;;
+        swupd)    echo "swupd (Clear Linux)" ;;
+        eopkg)    echo "eopkg (Solus)" ;;
+        urpmi)    echo "urpmi (Mageia/OpenMandriva)" ;;
+        slackpkg) echo "slackpkg (Slackware)" ;;
+        nix)      echo "nix (NixOS)" ;;
+        *)        echo "未识别" ;;
+    esac
+    return 0
+}
+
+# 发行版识别 (仅用于展示与问题定位)
+detect_distro() {
+    local n=""
+    if [[ -f /etc/os-release ]]; then
+        n="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-$NAME $VERSION_ID}")"
+    fi
+    if [[ -z "$n" ]] && [[ -f /etc/openwrt_release ]]; then
+        n="$(. /etc/openwrt_release 2>/dev/null; echo "OpenWrt ${DISTRIB_RELEASE}")"
+    fi
+    if [[ -z "$n" ]] && [[ -f /etc/redhat-release ]]; then
+        n="$(head -1 /etc/redhat-release 2>/dev/null)"
+    fi
+    if [[ -z "$n" ]] && [[ -f /etc/alpine-release ]]; then
+        n="Alpine Linux $(head -1 /etc/alpine-release 2>/dev/null)"
+    fi
+    if [[ -z "$n" ]] && [[ -f /etc/debian_version ]]; then
+        n="Debian $(head -1 /etc/debian_version 2>/dev/null)"
+    fi
+    if [[ -z "$n" ]]; then
+        n="$(uname -s) $(uname -r)"
+    fi
+    echo "$n"
+    return 0
+}
+
+# libc 类型 (glibc / musl), 影响某些依赖包名
+# 注意: Debian 等系统可能同时存在 /lib/ld-musl-* 兼容层与 glibc,
+#       所以必须优先用 ldd --version 判断真实主 libc, 不能只看文件。
+detect_libc() {
+    local v=""
+    if command -v ldd >/dev/null 2>&1; then
+        v="$(ldd --version 2>&1 | head -2)"
+        if echo "$v" | grep -qiE "glibc|GNU libc"; then
+            echo "glibc"
+            return 0
+        fi
+        if echo "$v" | grep -qi musl; then
+            echo "musl"
+            return 0
+        fi
+    fi
+    # 无 ldd (Alpine 上 ldd 是 busybox 链接) 时看动态链接器
+    if [[ -f /etc/alpine-release ]]; then
+        echo "musl"
+        return 0
+    fi
+    if ls /lib/ld-linux*.so* >/dev/null 2>&1 || ls /lib64/ld-linux*.so* >/dev/null 2>&1; then
+        echo "glibc"
+        return 0
+    fi
+    if ls /lib/ld-musl-*.so.1 >/dev/null 2>&1; then
+        echo "musl"
+        return 0
+    fi
+    echo "未知"
     return 0
 }
 
@@ -97,6 +488,12 @@ pkg_update_once() {
         apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 ;;
         apk)    apk update >/dev/null 2>&1 ;;
         pacman) pacman -Sy --noconfirm >/dev/null 2>&1 ;;
+        opkg)   opkg update >/dev/null 2>&1 ;;
+        xbps)   xbps-install -S >/dev/null 2>&1 ;;
+        emerge) emerge --sync --quiet >/dev/null 2>&1 ;;
+        urpmi)  urpmi.update -a >/dev/null 2>&1 ;;
+        slackpkg) slackpkg -batch=on update >/dev/null 2>&1 ;;
+        nix)    nix-channel --update >/dev/null 2>&1 ;;
     esac
     PKG_UPDATED=1
     return 0
@@ -109,56 +506,90 @@ pkg_install() {
     fi
     pkg_update_once
     case "$PKG_MGR" in
-        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1 ;;
-        dnf)    dnf install -y -q "$pkg" >/dev/null 2>&1 ;;
-        yum)    yum install -y -q "$pkg" >/dev/null 2>&1 ;;
-        apk)    apk add --no-cache "$pkg" >/dev/null 2>&1 ;;
-        pacman) pacman -S --noconfirm --needed "$pkg" >/dev/null 2>&1 ;;
-        zypper) zypper --non-interactive install -y "$pkg" >/dev/null 2>&1 ;;
-        *)      return 1 ;;
+        apt)      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1 ;;
+        dnf)      dnf install -y -q "$pkg" >/dev/null 2>&1 ;;
+        yum)      yum install -y -q "$pkg" >/dev/null 2>&1 ;;
+        apk)      apk add --no-cache "$pkg" >/dev/null 2>&1 ;;
+        pacman)   pacman -S --noconfirm --needed "$pkg" >/dev/null 2>&1 ;;
+        zypper)   zypper --non-interactive install -y "$pkg" >/dev/null 2>&1 ;;
+        opkg)     opkg install "$pkg" >/dev/null 2>&1 ;;
+        xbps)     xbps-install -y "$pkg" >/dev/null 2>&1 ;;
+        emerge)   emerge --quiet --noreplace "$pkg" >/dev/null 2>&1 ;;
+        swupd)    swupd bundle-add "$pkg" >/dev/null 2>&1 ;;
+        eopkg)    eopkg install -y "$pkg" >/dev/null 2>&1 ;;
+        urpmi)    urpmi --auto "$pkg" >/dev/null 2>&1 ;;
+        slackpkg) slackpkg -batch=on -default_answer=y install "$pkg" >/dev/null 2>&1 ;;
+        nix)      nix-env -iA "nixpkgs.$pkg" >/dev/null 2>&1 ;;
+        *)        return 1 ;;
     esac
     return $?
 }
 
 # 依赖表: 命令名 -> 各发行版包名
-# 格式: cmd|apt包|rpm包|apk包|arch包
+# 格式: cmd|apt|rpm(dnf/yum/zypper)|apk|arch|opkg|xbps|emerge|swupd
+# 某列为 - 表示该系统上无独立包 (通常已内置)
 DEPS_TABLE="
-curl|curl|curl|curl|curl
-wget|wget|wget|wget|wget
-crontab|cron|cronie|dcron|cronie
-logrotate|logrotate|logrotate|logrotate|logrotate
-python3|python3|python3|python3|python
-tar|tar|tar|tar|tar
-awk|gawk|gawk|gawk|gawk
-openssl|openssl|openssl|openssl|openssl
+curl|curl|curl|curl|curl|curl|curl|net-misc/curl|curl
+wget|wget|wget|wget|wget|wget|wget|net-misc/wget|wget
+crontab|cron|cronie|dcron|cronie|cron|cronie|sys-process/cronie|cronie
+logrotate|logrotate|logrotate|logrotate|logrotate|logrotate|logrotate|app-admin/logrotate|-
+python3|python3|python3|python3|python|python3-light|python3|dev-lang/python|python3-basic
+tar|tar|tar|tar|tar|tar|tar|app-arch/tar|-
+awk|gawk|gawk|gawk|gawk|gawk|gawk|sys-apps/gawk|-
+openssl|openssl|openssl|openssl|openssl|openssl-util|openssl|dev-libs/openssl|openssl
+ca-certificates|ca-certificates|ca-certificates|ca-certificates|ca-certificates|ca-bundle|ca-certificates|app-misc/ca-certificates|-
 "
 
 resolve_pkg_name() {
-    local cmd="$1" line apt_p rpm_p apk_p arch_p
-    while IFS="|" read -r line apt_p rpm_p apk_p arch_p; do
+    local cmd="$1" line apt_p rpm_p apk_p arch_p opkg_p xbps_p emerge_p swupd_p out=""
+    while IFS="|" read -r line apt_p rpm_p apk_p arch_p opkg_p xbps_p emerge_p swupd_p; do
         if [[ "$line" == "$cmd" ]]; then
             case "$PKG_MGR" in
-                apt)            echo "$apt_p"; return 0 ;;
-                dnf|yum|zypper) echo "$rpm_p"; return 0 ;;
-                apk)            echo "$apk_p"; return 0 ;;
-                pacman)         echo "$arch_p"; return 0 ;;
+                apt)                   out="$apt_p" ;;
+                dnf|yum|zypper|urpmi)  out="$rpm_p" ;;
+                apk)                   out="$apk_p" ;;
+                pacman)                out="$arch_p" ;;
+                opkg)                  out="$opkg_p" ;;
+                xbps|nix)              out="$xbps_p" ;;
+                emerge)                out="$emerge_p" ;;
+                swupd)                 out="$swupd_p" ;;
+                eopkg|slackpkg)        out="$cmd" ;;
+                *)                     out="$cmd" ;;
             esac
+            # 该系统无独立包时用命令名兜底
+            if [[ -z "$out" ]] || [[ "$out" == "-" ]]; then
+                out="$cmd"
+            fi
+            echo "$out"
+            return 0
         fi
     done <<< "$DEPS_TABLE"
     echo "$cmd"
     return 0
 }
 
+# 必需依赖: 缺失会导致安装失败
+DEPS_REQUIRED="curl tar"
+# 重要依赖: 缺失会导致部分功能不可用, 但不阻断安装
+DEPS_IMPORTANT="wget awk openssl"
+# 可选依赖: 缺失只影响附加能力 (定时任务/日志轮转/高级配置)
+DEPS_OPTIONAL="crontab logrotate python3"
+
+# 记录哪些能力因依赖缺失被降级, 安装结束时统一提示
+DEGRADED_FEATURES=""
+
 install_dependencies() {
     print_info "检查依赖..."
     detect_pkg_mgr
-    if [[ -z "$PKG_MGR" ]]; then
-        print_warn "未识别包管理器, 跳过依赖自动安装"
-        return 0
-    fi
 
-    local missing=() cmd pkg
-    for cmd in curl wget crontab logrotate python3 tar awk openssl; do
+    echo -e "   系统: ${CYAN}$(detect_distro)${NC}"
+    echo -e "   架构: ${CYAN}$(uname -m)${NC} → 资产 ${GREEN}$(get_arch)${NC} ${DIM}($(arch_desc "$(get_arch)"))${NC}"
+    echo -e "   init: ${CYAN}$(init_desc)${NC}   libc: ${CYAN}$(detect_libc)${NC}   包管理: ${CYAN}$(pkg_mgr_desc)${NC}"
+    echo ""
+
+    local missing=() cmd pkg all_deps
+    all_deps="$DEPS_REQUIRED $DEPS_IMPORTANT $DEPS_OPTIONAL"
+    for cmd in $all_deps; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -166,7 +597,14 @@ install_dependencies() {
 
     if [[ ${#missing[@]} -eq 0 ]]; then
         print_ok "依赖已齐全"
+        _post_dep_setup
         return 0
+    fi
+
+    if [[ -z "$PKG_MGR" ]]; then
+        print_warn "未识别包管理器, 无法自动安装依赖: ${missing[*]}"
+        _check_required_deps
+        return $?
     fi
 
     print_warn "缺少依赖: ${missing[*]}"
@@ -178,34 +616,246 @@ install_dependencies() {
                 echo -e "${GREEN}成功${NC}"
             else
                 echo -e "${YELLOW}已装包但命令仍缺失${NC}"
+                _try_alt_pkg "$cmd"
             fi
         else
             echo -e "${RED}失败${NC}"
+            _try_alt_pkg "$cmd"
         fi
     done
 
-    # cron 服务需要启动
+    _post_dep_setup
+    _check_required_deps
+    return $?
+}
+
+# 主包名装不上时尝试备用包名 (不同发行版命名差异很大)
+_try_alt_pkg() {
+    local cmd="$1" alts="" a
+    case "$cmd" in
+        crontab)   alts="cronie cron dcron busybox-cron vixie-cron fcron" ;;
+        python3)   alts="python3 python3-minimal python311 python310 python39 python3-light python3-base" ;;
+        awk)       alts="gawk mawk busybox-awk original-awk" ;;
+        openssl)   alts="openssl openssl-util libressl openssl1.1" ;;
+        wget)      alts="wget wget-ssl uclient-fetch busybox-wget" ;;
+        curl)      alts="curl libcurl4 curl-minimal" ;;
+        logrotate) alts="logrotate busybox-logrotate" ;;
+        tar)       alts="tar gnu-tar busybox-tar" ;;
+        *)         return 1 ;;
+    esac
+    for a in $alts; do
+        if [[ "$a" == "$(resolve_pkg_name "$cmd")" ]]; then
+            continue
+        fi
+        echo -ne "    尝试备用包 ${CYAN}${a}${NC} ... "
+        if pkg_install "$a" && command -v "$cmd" >/dev/null 2>&1; then
+            echo -e "${GREEN}成功${NC}"
+            return 0
+        fi
+        echo -e "${DIM}无效${NC}"
+    done
+    return 1
+}
+
+# 依赖安装后的收尾: 启动 cron, 标记降级能力
+_post_dep_setup() {
+    # cron 守护需要启动 (定时任务依赖)
     if command -v crontab >/dev/null 2>&1; then
         local cron_svc=""
-        for cron_svc in cron crond cronie; do
-            if systemctl list-unit-files 2>/dev/null | grep -q "^${cron_svc}\.service"; then
-                systemctl enable --now "$cron_svc" >/dev/null 2>&1
+        for cron_svc in cron crond cronie dcron fcron; do
+            if _try_enable_cron_svc "$cron_svc"; then
                 break
             fi
+        done
+    fi
+
+    DEGRADED_FEATURES=""
+    # 定时任务能力: systemd timer 或 crontab 二者有一即可
+    if [[ "$(detect_init)" != "systemd" ]] && ! command -v crontab >/dev/null 2>&1; then
+        DEGRADED_FEATURES="${DEGRADED_FEATURES}GeoData 自动更新与更新检查 (无 systemd timer 也无 crontab)\n"
+    fi
+    if ! command -v logrotate >/dev/null 2>&1; then
+        DEGRADED_FEATURES="${DEGRADED_FEATURES}访问/错误日志自动轮转 (缺 logrotate, 已改用内置大小裁剪)\n"
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        DEGRADED_FEATURES="${DEGRADED_FEATURES}面板高级配置 (节点编辑/路由/链接导入需 python3)\n"
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        DEGRADED_FEATURES="${DEGRADED_FEATURES}自签证书生成 (缺 openssl)\n"
+    fi
+    return 0
+}
+
+# 校验必需依赖。缺失则返回 1 阻断安装。
+_check_required_deps() {
+    local cmd lack=""
+    for cmd in $DEPS_REQUIRED; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            lack="${lack}${cmd} "
+        fi
+    done
+    # curl 缺失但有 wget 时可以互替
+    if [[ "$lack" == *curl* ]] && command -v wget >/dev/null 2>&1; then
+        lack="${lack/curl /}"
+    fi
+    if [[ -n "$lack" ]]; then
+        print_error "必需依赖缺失且无法自动安装: ${lack}"
+        print_info "请手动安装后重试。例如:"
+        case "$PKG_MGR" in
+            opkg) echo "  opkg update && opkg install ${lack}" ;;
+            apk)  echo "  apk add ${lack}" ;;
+            *)    echo "  用本机包管理器安装: ${lack}" ;;
+        esac
+        return 1
+    fi
+    if [[ -n "$DEGRADED_FEATURES" ]]; then
+        echo ""
+        print_warn "以下能力因依赖缺失被降级:"
+        printf "%b" "$DEGRADED_FEATURES" | while IFS= read -r l; do
+            if [[ -n "$l" ]]; then echo -e "    ${DIM}· ${l}${NC}"; fi
         done
     fi
     return 0
 }
 
 # ==================== 版本与架构 ====================
+# 判断 32 位 ARM 是否具备硬浮点 (VFP)。无 VFP 只能用 armv5 软浮点二进制。
+_arm_has_vfp() {
+    if grep -qiE "^Features.*\b(vfpv3|vfpv4|neon|vfpd32)\b" /proc/cpuinfo 2>/dev/null; then
+        return 0
+    fi
+    if grep -qiE "^Features.*\bvfp\b" /proc/cpuinfo 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# 判断 ARM 架构代号 (armv6 需要 VFPv2+, armv7 需要 ARMv7 指令集)
+_arm_variant() {
+    local archline model
+    archline="$(grep -iE "^CPU architecture" /proc/cpuinfo 2>/dev/null | head -1 | grep -oE "[0-9]+" | head -1)"
+    model="$(uname -m)"
+    # uname -m 已经给出明确代号时优先采用
+    case "$model" in
+        armv7*|armv8*) echo "armv7"; return 0 ;;
+        armv6*)
+            if _arm_has_vfp; then echo "armv6"; else echo "armv5"; fi
+            return 0 ;;
+        armv5*|armv4*) echo "armv5"; return 0 ;;
+    esac
+    if [[ -n "$archline" ]]; then
+        if [[ "$archline" -ge 7 ]] && _arm_has_vfp; then echo "armv7"; return 0; fi
+        if [[ "$archline" -ge 6 ]] && _arm_has_vfp; then echo "armv6"; return 0; fi
+    fi
+    echo "armv5"
+    return 0
+}
+
+# 判断 64 位内核是否跑在 32 位用户态 (常见于树莓派 32 位系统)。
+# uname -m 报 aarch64 但 /bin/sh 是 32 位 ELF 时, 必须下 32 位二进制。
+_userland_is_32bit() {
+    local f
+    f="$(command -v sh 2>/dev/null)"
+    if [[ -z "$f" ]]; then return 1; fi
+    # ELF 头第 5 字节: 1=32位, 2=64位
+    local c
+    c="$(od -An -tu1 -j4 -N1 "$f" 2>/dev/null | tr -d " ")"
+    if [[ "$c" == "1" ]]; then return 0; fi
+    return 1
+}
+
+# 发布资产支持的架构白名单 (与 build-release.sh 的 ARCH_LIST 必须一致)
+SUPPORTED_ARCHES="amd64 386 arm64 armv7 armv6 armv5 mips mipsle mips64 mips64le ppc64 ppc64le riscv64 s390x loong64"
+
+# 返回发布资产使用的架构名。覆盖 Go 支持的全部 linux 架构。
+# 可用 XRAYR_ARCH 环境变量强制指定 (自动识别失败或需要交叉安装时)。
 get_arch() {
-    local arch
+    local arch le
+    if [[ -n "$XRAYR_ARCH" ]]; then
+        # 校验是否在白名单内, 防止拼错导致下载 404
+        case " $SUPPORTED_ARCHES " in
+            *" $XRAYR_ARCH "*) echo "$XRAYR_ARCH"; return 0 ;;
+            *) print_warn "XRAYR_ARCH=$XRAYR_ARCH 不在支持列表内, 已忽略" >&2 ;;
+        esac
+    fi
     arch="$(uname -m)"
     case "$arch" in
-        x86_64|amd64)  echo "amd64"; return 0 ;;
-        aarch64|arm64) echo "arm64"; return 0 ;;
-        *)             echo ""; return 1 ;;
+        x86_64|amd64|x64)
+            if _userland_is_32bit; then echo "386"; else echo "amd64"; fi
+            return 0 ;;
+        i386|i486|i586|i686|x86|i86pc)
+            echo "386"; return 0 ;;
+        aarch64|aarch64_be|arm64|armv8b|armv8l)
+            if _userland_is_32bit; then _arm_variant; else echo "arm64"; fi
+            return 0 ;;
+        armv7*|armv6*|armv5*|armv4*|arm|armel|armhf)
+            _arm_variant; return 0 ;;
+        loongarch64|loong64)
+            echo "loong64"; return 0 ;;
+        riscv64)
+            echo "riscv64"; return 0 ;;
+        s390x)
+            echo "s390x"; return 0 ;;
+        ppc64le|powerpc64le)
+            echo "ppc64le"; return 0 ;;
+        ppc64|powerpc64)
+            echo "ppc64"; return 0 ;;
+        mips64el|mips64le)
+            echo "mips64le"; return 0 ;;
+        mips64)
+            # 部分系统 mips64 小端也报 mips64, 用运行时字节序兜底
+            le="$(_cpu_endian)"
+            if [[ "$le" == "little" ]]; then echo "mips64le"; else echo "mips64"; fi
+            return 0 ;;
+        mipsel|mipsle)
+            echo "mipsle"; return 0 ;;
+        mips)
+            le="$(_cpu_endian)"
+            if [[ "$le" == "little" ]]; then echo "mipsle"; else echo "mips"; fi
+            return 0 ;;
+        *)
+            echo ""; return 1 ;;
     esac
+}
+
+# 运行时字节序检测 (mips/mips64 的 uname -m 不区分大小端)
+_cpu_endian() {
+    if [[ -r /bin/sh ]]; then
+        local c
+        c="$(od -An -tu1 -j5 -N1 /bin/sh 2>/dev/null | tr -d " ")"
+        if [[ "$c" == "1" ]]; then echo "little"; return 0; fi
+        if [[ "$c" == "2" ]]; then echo "big"; return 0; fi
+    fi
+    # 退化方案: printf 输出多字节整数看首字节
+    if printf "\x01\x02" | od -An -tx2 2>/dev/null | grep -q "0201"; then
+        echo "little"
+    else
+        echo "big"
+    fi
+    return 0
+}
+
+# 架构中文说明, 用于安装时展示
+arch_desc() {
+    case "$1" in
+        amd64)    echo "64 位 x86 (Intel/AMD)" ;;
+        386)      echo "32 位 x86" ;;
+        arm64)    echo "64 位 ARM (ARMv8/v9)" ;;
+        armv7)    echo "32 位 ARM (ARMv7 硬浮点)" ;;
+        armv6)    echo "32 位 ARM (ARMv6 硬浮点)" ;;
+        armv5)    echo "32 位 ARM (ARMv5 软浮点)" ;;
+        mips)     echo "MIPS 大端 (软浮点)" ;;
+        mipsle)   echo "MIPS 小端 (软浮点)" ;;
+        mips64)   echo "MIPS64 大端" ;;
+        mips64le) echo "MIPS64 小端" ;;
+        ppc64)    echo "PowerPC64 大端" ;;
+        ppc64le)  echo "PowerPC64 小端" ;;
+        riscv64)  echo "RISC-V 64 位" ;;
+        s390x)    echo "IBM Z (s390x)" ;;
+        loong64)  echo "龙芯 LoongArch 64 位" ;;
+        *)        echo "未知" ;;
+    esac
+    return 0
 }
 
 get_latest_version() {
@@ -546,14 +1196,14 @@ do_upgrade_to() {
     if [[ "$(svc_state)" == "running" ]]; then
         was_running=1
     fi
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+    svc_stop
 
     if ! download_binary "$target" "$arch"; then
         print_error "下载失败, 回滚到原版本"
         cp -f "$bak" "${INSTALL_DIR}/XrayR" 2>/dev/null
         chmod +x "${INSTALL_DIR}/XrayR"
         if [[ $was_running -eq 1 ]]; then
-            systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+            svc_start
         fi
         return 1
     fi
@@ -564,7 +1214,7 @@ do_upgrade_to() {
         cp -f "$bak" "${INSTALL_DIR}/XrayR" 2>/dev/null
         chmod +x "${INSTALL_DIR}/XrayR"
         if [[ $was_running -eq 1 ]]; then
-            systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+            svc_start
         fi
         return 1
     fi
@@ -577,16 +1227,16 @@ do_upgrade_to() {
     write_version_state "$target"
 
     if [[ $was_running -eq 1 ]]; then
-        systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+        svc_start
         sleep 2
         if [[ "$(svc_state)" != "running" ]]; then
             print_error "服务启动失败! 正在回滚到 ${cur}"
-            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+            svc_stop
             cp -f "$bak" "${INSTALL_DIR}/XrayR" 2>/dev/null
             chmod +x "${INSTALL_DIR}/XrayR"
             write_version_state "${cur}"
-            systemctl start "$SERVICE_NAME" >/dev/null 2>&1
-            print_warn "已回滚, 请检查日志: journalctl -u XrayR -n 50"
+            svc_start
+            print_warn "已回滚, 请检查日志: xrayr 菜单 [8] 查看日志"
             return 1
         fi
     fi
@@ -762,8 +1412,8 @@ fi
 UPEOF
     chmod +x "${INSTALL_DIR}/update-check.sh"
 
-    # 优先 systemd timer, 回退 cron
-    if command -v systemctl >/dev/null 2>&1; then
+    # 优先 systemd timer, 回退 cron; 非 systemd 系统直接走 cron
+    if [[ "$(detect_init)" == "systemd" ]]; then
         cat > /etc/systemd/system/xrayr-update-check.service <<'USEOF'
 [Unit]
 Description=XrayR Update Check
@@ -788,7 +1438,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UTEOF
-        systemctl daemon-reload >/dev/null 2>&1
+        svc_daemon_reload
         if [[ "$auto_check" == "true" ]]; then
             systemctl enable --now xrayr-update-check.timer >/dev/null 2>&1
             print_ok "自动更新检查已启用 (systemd timer, 每日 ${hh:-5}:${mm:-25})"
@@ -1013,12 +1663,12 @@ menu_update() {
                 if [[ "$(svc_state)" == "running" ]]; then
                     was=1
                 fi
-                systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+                svc_stop
                 cp -f "$src" "${INSTALL_DIR}/XrayR"
                 chmod +x "${INSTALL_DIR}/XrayR"
                 write_version_state "$("${INSTALL_DIR}/XrayR" version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
                 if [[ $was -eq 1 ]]; then
-                    systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+                    svc_start
                 fi
                 print_ok "已回滚到 $(basename "$src")"
                 pause ;;
@@ -1286,9 +1936,24 @@ GEOCONFEOF
     return 0
 }
 
-# ==================== systemd ====================
+# ==================== 服务单元安装 (多 init 系统) ====================
+# install_systemd_service 保留旧名作为统一入口, 内部按 init 系统分派。
 install_systemd_service() {
-    cat > "${SERVICE_FILE}" << 'SVCEOF'
+    local it
+    it="$(detect_init)"
+    case "$it" in
+        systemd)  _svcfile_systemd ;;
+        openrc)   _svcfile_openrc ;;
+        sysvinit) _svcfile_sysvinit ;;
+        procd)    _svcfile_procd ;;
+        *)        _svcfile_bare ;;
+    esac
+    return 0
+}
+
+_svcfile_systemd() {
+    mkdir -p /etc/systemd/system
+    cat > "${SERVICE_FILE}" << SVCEOF
 [Unit]
 Description=XrayR Service
 After=network.target nss-lookup.target
@@ -1297,7 +1962,7 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/XrayR/XrayR --config /etc/XrayR/config.yml
+ExecStart=${INSTALL_DIR}/XrayR --config ${CONFIG_DIR}/config.yml
 Restart=always
 RestartSec=3s
 LimitNOFILE=1048576
@@ -1313,9 +1978,157 @@ IOSchedulingPriority=2
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-    systemctl daemon-reload
-    systemctl enable ${SERVICE_NAME} >/dev/null 2>&1
+    systemctl daemon-reload >/dev/null 2>&1
+    svc_enable
     print_ok "systemd 服务已创建"
+    return 0
+}
+
+# OpenRC (Alpine / Gentoo)
+_svcfile_openrc() {
+    mkdir -p /etc/init.d
+    cat > "${SERVICE_FILE}" << OREOF
+#!/sbin/openrc-run
+
+name="XrayR"
+description="XrayR Service"
+command="${INSTALL_DIR}/XrayR"
+command_args="--config ${CONFIG_DIR}/config.yml"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/xrayr.log"
+error_log="/var/log/xrayr.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --mode 0755 /var/log
+    # 提升文件描述符上限 (OpenRC 无 LimitNOFILE, 用 ulimit)
+    ulimit -n 1048576 2>/dev/null || ulimit -n 65535 2>/dev/null
+    return 0
+}
+OREOF
+    chmod +x "${SERVICE_FILE}"
+    # OpenRC 的 rlimit 配置
+    mkdir -p /etc/conf.d
+    cat > /etc/conf.d/XrayR << ORCEOF
+rc_ulimit="-n 1048576"
+ORCEOF
+    svc_enable
+    print_ok "OpenRC 服务已创建 (${SERVICE_FILE})"
+    return 0
+}
+
+# SysVinit (老 Debian / CentOS 6 / Devuan)
+_svcfile_sysvinit() {
+    mkdir -p /etc/init.d
+    cat > "${SERVICE_FILE}" << SVEOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          XrayR
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: XrayR Service
+### END INIT INFO
+
+BIN="${INSTALL_DIR}/XrayR"
+CFG="${CONFIG_DIR}/config.yml"
+PIDFILE="/var/run/xrayr.pid"
+LOGFILE="/var/log/xrayr.log"
+
+is_running() {
+    if [ -f "\$PIDFILE" ]; then
+        p=\$(cat "\$PIDFILE" 2>/dev/null)
+        if [ -n "\$p" ] && kill -0 "\$p" 2>/dev/null; then return 0; fi
+    fi
+    pgrep -f "\$BIN --config" >/dev/null 2>&1
+    return \$?
+}
+
+do_start() {
+    if is_running; then echo "XrayR 已在运行"; return 0; fi
+    ulimit -n 1048576 2>/dev/null || ulimit -n 65535 2>/dev/null
+    setsid nohup "\$BIN" --config "\$CFG" >> "\$LOGFILE" 2>&1 < /dev/null &
+    echo \$! > "\$PIDFILE"
+    sleep 1
+    if is_running; then echo "XrayR 已启动"; return 0; fi
+    echo "XrayR 启动失败, 见 \$LOGFILE"
+    return 1
+}
+
+do_stop() {
+    if [ -f "\$PIDFILE" ]; then
+        p=\$(cat "\$PIDFILE" 2>/dev/null)
+        [ -n "\$p" ] && kill "\$p" 2>/dev/null
+    fi
+    pkill -f "\$BIN --config" 2>/dev/null
+    rm -f "\$PIDFILE"
+    echo "XrayR 已停止"
+    return 0
+}
+
+case "\$1" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; sleep 1; do_start ;;
+    status)
+        if is_running; then echo "XrayR 运行中"; exit 0; else echo "XrayR 已停止"; exit 3; fi ;;
+    *) echo "用法: \$0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit \$?
+SVEOF
+    chmod +x "${SERVICE_FILE}"
+    svc_enable
+    print_ok "SysVinit 服务已创建 (${SERVICE_FILE})"
+    return 0
+}
+
+# procd (OpenWrt)
+_svcfile_procd() {
+    mkdir -p /etc/init.d
+    cat > "${SERVICE_FILE}" << PDEOF
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command ${INSTALL_DIR}/XrayR --config ${CONFIG_DIR}/config.yml
+    procd_set_param respawn 3600 5 0
+    procd_set_param limits nofile="1048576 1048576"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    killall XrayR 2>/dev/null
+}
+
+reload_service() {
+    stop
+    start
+}
+PDEOF
+    chmod +x "${SERVICE_FILE}"
+    svc_enable
+    print_ok "procd 服务已创建 (${SERVICE_FILE})"
+    return 0
+}
+
+# 无 init 系统 (极简容器 / chroot)
+_svcfile_bare() {
+    print_warn "未检测到受支持的 init 系统, 使用裸进程守护模式"
+    bare_enable
+    print_ok "裸进程模式已配置 (开机自启走 cron @reboot, 日志 ${BARE_LOGFILE})"
+    print_info "手动控制: ${GREEN}xrayr${NC} 面板内启动/停止, 或直接 ${INSTALL_DIR}/XrayR --config ${CONFIG_DIR}/config.yml"
     return 0
 }
 
@@ -1433,11 +2246,26 @@ echo "  已回写 $okc 项, 跳过 $skipc 项"
 sysctl --system >/dev/null 2>&1
 
 echo "${C}[4/4] 重载并重启服务${N}"
-systemctl daemon-reload
-systemctl restart XrayR 2>/dev/null
+# init 系统自适应 (restore.sh 是独立脚本, 需自带检测)
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl restart XrayR 2>/dev/null
+    SVCSTAT="$(systemctl is-active XrayR 2>/dev/null)"
+elif command -v rc-service >/dev/null 2>&1; then
+    rc-service XrayR restart >/dev/null 2>&1
+    SVCSTAT="$(rc-service XrayR status 2>/dev/null | head -1)"
+elif [ -x /etc/init.d/XrayR ]; then
+    /etc/init.d/XrayR restart >/dev/null 2>&1
+    SVCSTAT="$(/etc/init.d/XrayR status 2>/dev/null | head -1)"
+else
+    pkill -f "/usr/local/XrayR/XrayR --config" 2>/dev/null
+    sleep 1
+    setsid nohup /usr/local/XrayR/XrayR --config /etc/XrayR/config.yml >> /var/log/xrayr.log 2>&1 < /dev/null &
+    SVCSTAT="裸进程模式已重启"
+fi
 sleep 3
 echo ""
-echo "  服务状态 : $(systemctl is-active XrayR 2>/dev/null)"
+echo "  服务状态 : ${SVCSTAT}
 echo "  拥塞控制 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
 echo "  默认qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
 echo "  rmem_max : $(sysctl -n net.core.rmem_max 2>/dev/null)"
@@ -1460,7 +2288,11 @@ tune_show_current() {
     rmax="$(sysctl -n net.core.rmem_max 2>/dev/null)"
     keep="$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)"
     somax="$(sysctl -n net.core.somaxconn 2>/dev/null)"
-    nproc_v="$(systemctl show XrayR -p LimitNPROC --value 2>/dev/null)"
+    if [[ "$(detect_init)" == "systemd" ]]; then
+        nproc_v="$(systemctl show XrayR -p LimitNPROC --value 2>/dev/null)"
+    else
+        nproc_v="$(ulimit -u 2>/dev/null)"
+    fi
 
     # 中文列对齐 (中文按 2 列宽计算)
     _trow() {
@@ -1766,7 +2598,7 @@ MaxRetentionSec=2week
 RateLimitIntervalSec=30s
 RateLimitBurst=10000
 JDEOF
-    systemctl restart systemd-journald >/dev/null 2>&1
+    if [[ "$(detect_init)" == "systemd" ]]; then systemctl restart systemd-journald >/dev/null 2>&1; fi
 
     mkdir -p "/etc/systemd/system/${SERVICE_NAME}.service.d"
     cat > "/etc/systemd/system/${SERVICE_NAME}.service.d/limits.conf" << 'SDEOF'
@@ -1774,7 +2606,7 @@ JDEOF
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=5000
 SDEOF
-    systemctl daemon-reload
+    svc_daemon_reload
     print_ok "日志限制已安装 (access/error 10M×7, geo 2M×4, journal 200M)"
     return 0
 }
@@ -1787,8 +2619,7 @@ install_geo_cron() {
         pkg_install "$(resolve_pkg_name crontab)"
         local cron_svc=""
         for cron_svc in cron crond cronie; do
-            if systemctl list-unit-files 2>/dev/null | grep -q "^${cron_svc}\.service"; then
-                systemctl enable --now "$cron_svc" >/dev/null 2>&1
+            if _try_enable_cron_svc "$cron_svc"; then
                 break
             fi
         done
@@ -1926,7 +2757,7 @@ if [[ $rc -eq 0 ]]; then updated=1; fi
 if [[ $rc -eq 1 ]]; then failed=1; fi
 
 if [[ $updated -eq 1 ]] && [[ "$GEO_AUTO_RESTART" == "true" ]]; then
-    if systemctl restart "$SERVICE_NAME" 2>/dev/null; then
+    if svc_restart; then
         log "XrayR 已重启以加载新规则"
     else
         log "ERROR: XrayR 重启失败"
@@ -1975,8 +2806,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 TTEOF
-    systemctl daemon-reload
-    systemctl enable --now xrayr-geo-update.timer >/dev/null 2>&1
+    svc_daemon_reload
+    systemctl enable --now xrayr-geo-update.timer >/dev/null 2>&1  # 仅 systemd 路径调用
     print_ok "GeoData systemd timer 已启用 (每天 04:30)"
     return 0
 }
@@ -2005,7 +2836,7 @@ svc_state() {
         echo "none"
         return 0
     fi
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    if svc_is_active; then
         echo "running"
     else
         echo "stopped"
@@ -2014,7 +2845,7 @@ svc_state() {
 }
 
 svc_autostart() {
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+    if svc_is_enabled; then
         echo "on"
     else
         echo "off"
@@ -2103,7 +2934,7 @@ geo_schedule_desc() {
             return 0
         fi
     fi
-    if systemctl is-enabled --quiet xrayr-geo-update.timer 2>/dev/null; then
+    if [[ "$(detect_init)" == "systemd" ]] && systemctl is-enabled --quiet xrayr-geo-update.timer 2>/dev/null; then
         echo "每天 04:30 (systemd timer)"
         return 0
     fi
@@ -2152,10 +2983,11 @@ show_status_block() {
         *)       echo -e "   运行状态   ${DIM}服务未注册${NC}" ;;
     esac
     if [[ "$auto" == "on" ]]; then
-        echo -e "   开机自启   ${GREEN}已启用${NC}"
+        echo -e "   开机自启   ${GREEN}已启用${NC}    服务管理  ${CYAN}$(init_desc)${NC}"
     else
-        echo -e "   开机自启   ${YELLOW}未启用${NC}"
+        echo -e "   开机自启   ${YELLOW}未启用${NC}    服务管理  ${CYAN}$(init_desc)${NC}"
     fi
+    echo -e "   系统架构   ${CYAN}$(get_arch)${NC} ${DIM}($(arch_desc "$(get_arch)"))${NC}"
 
     if is_installed; then
         src="$(geo_conf_get GEO_SOURCE loyalsoldier)"
@@ -2218,7 +3050,21 @@ do_install() {
     local arch version
     arch="$(get_arch)"
     if [[ -z "$arch" ]]; then
-        print_error "不支持的系统架构: $(uname -m)"
+        print_error "无法识别系统架构: $(uname -m)"
+        echo ""
+        print_info "当前发布支持以下架构 (共 15 种):"
+        echo -e "   ${CYAN}amd64${NC} ${CYAN}386${NC} ${CYAN}arm64${NC} ${CYAN}armv7${NC} ${CYAN}armv6${NC} ${CYAN}armv5${NC}"
+        echo -e "   ${CYAN}mips${NC} ${CYAN}mipsle${NC} ${CYAN}mips64${NC} ${CYAN}mips64le${NC}"
+        echo -e "   ${CYAN}ppc64${NC} ${CYAN}ppc64le${NC} ${CYAN}riscv64${NC} ${CYAN}s390x${NC} ${CYAN}loong64${NC}"
+        echo ""
+        print_info "若你的架构在上表中, 可用环境变量强制指定后重试:"
+        echo -e "   ${GREEN}XRAYR_ARCH=mipsle bash install.sh${NC}"
+        echo ""
+        print_info "诊断信息 (反馈问题时请附上):"
+        echo "   uname -m  : $(uname -m)"
+        echo "   uname -a  : $(uname -a 2>/dev/null | cut -c1-120)"
+        echo "   发行版    : $(detect_distro)"
+        echo "   libc      : $(detect_libc)"
         return 1
     fi
     version="$(get_latest_version)"
@@ -2232,7 +3078,7 @@ do_install() {
     echo -e "   系统架构: ${GREEN}${arch}${NC}   目标版本: ${GREEN}${version}${NC}"
     echo ""
 
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+    svc_stop
 
     if ! download_binary "$version" "$arch"; then
         print_error "二进制下载失败, 安装中止"
@@ -2302,12 +3148,12 @@ do_upgrade() {
     if [[ "$(svc_state)" == "running" ]]; then
         was_running=1
     fi
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
+    svc_stop
 
     if ! download_binary "$version" "$arch"; then
         print_error "升级失败, 保持原版本"
         if [[ $was_running -eq 1 ]]; then
-            systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+            svc_start
         fi
         return 1
     fi
@@ -2320,7 +3166,7 @@ do_upgrade() {
     rm -f /etc/XrayR/.update-available "$UPDATE_CACHE_FILE"
 
     if [[ $was_running -eq 1 ]]; then
-        systemctl start "$SERVICE_NAME" >/dev/null 2>&1
+        svc_start
     fi
     print_ok "已升级到 ${version}"
     local _nc
@@ -2349,18 +3195,22 @@ do_uninstall() {
     fi
 
     print_info "停止并注销服务..."
-    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1
-    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
+    svc_stop
+    svc_disable
     rm -f "$SERVICE_FILE"
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service.d/limits.conf"
     rmdir "/etc/systemd/system/${SERVICE_NAME}.service.d" 2>/dev/null
+    if [[ "$(detect_init)" == "systemd" ]]; then
     systemctl stop xrayr-geo-update.timer >/dev/null 2>&1
     systemctl disable xrayr-geo-update.timer >/dev/null 2>&1
+    fi
     rm -f /etc/systemd/system/xrayr-geo-update.timer /etc/systemd/system/xrayr-geo-update.service
+    if [[ "$(detect_init)" == "systemd" ]]; then
     systemctl stop xrayr-update-check.timer >/dev/null 2>&1
     systemctl disable xrayr-update-check.timer >/dev/null 2>&1
+    fi
     rm -f /etc/systemd/system/xrayr-update-check.timer /etc/systemd/system/xrayr-update-check.service
-    systemctl daemon-reload >/dev/null 2>&1
+    svc_daemon_reload
     print_ok "服务已注销"
 
     print_info "删除程序文件..."
@@ -2382,7 +3232,7 @@ do_uninstall() {
     rm -f /var/log/xrayr-geo-update.log
     rm -f /var/log/xrayr-update-check.log
     rm -f "$UPDATE_CACHE_FILE" /etc/XrayR/.update-available
-    systemctl restart systemd-journald >/dev/null 2>&1
+    if [[ "$(detect_init)" == "systemd" ]]; then systemctl restart systemd-journald >/dev/null 2>&1; fi
     print_ok "定时任务与日志规则已清理"
 
     local del_conf=""
@@ -2420,14 +3270,14 @@ menu_service() {
             return 0
         fi
         case "$c" in
-            1) systemctl start "$SERVICE_NAME" && print_ok "已启动" || print_error "启动失败"; pause ;;
-            2) systemctl stop "$SERVICE_NAME" && print_ok "已停止" || print_error "停止失败"; pause ;;
-            3) systemctl restart "$SERVICE_NAME" && print_ok "已重启" || print_error "重启失败"; pause ;;
-            4) systemctl status "$SERVICE_NAME" --no-pager -l 2>&1 | head -30; pause ;;
-            5) systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 && print_ok "开机自启已启用"; pause ;;
-            6) systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 && print_ok "开机自启已关闭"; pause ;;
-            7) echo -e "   ${DIM}Ctrl+C 退出日志查看${NC}"; journalctl -u "$SERVICE_NAME" -f --no-pager ;;
-            8) journalctl -u "$SERVICE_NAME" -n 100 --no-pager 2>&1 | tail -100; pause ;;
+            1) svc_start && print_ok "已启动" || print_error "启动失败"; pause ;;
+            2) svc_stop && print_ok "已停止" || print_error "停止失败"; pause ;;
+            3) svc_restart && print_ok "已重启" || print_error "重启失败"; pause ;;
+            4) svc_status_text; pause ;;
+            5) svc_enable && print_ok "开机自启已启用"; pause ;;
+            6) svc_disable && print_ok "开机自启已关闭"; pause ;;
+            7) echo -e "   ${DIM}Ctrl+C 退出日志查看${NC}"; svc_log_follow ;;
+            8) svc_log_tail 100; pause ;;
             0) return 0 ;;
             *) print_warn "无效选择"; sleep 1 ;;
         esac
@@ -2498,7 +3348,7 @@ menu_geodata() {
                     if command -v crontab >/dev/null 2>&1; then
                         crontab -l 2>/dev/null | grep -v "geo-update.sh" | crontab - >/dev/null 2>&1
                     fi
-                    systemctl disable --now xrayr-geo-update.timer >/dev/null 2>&1
+                    if [[ "$(detect_init)" == "systemd" ]]; then systemctl disable --now xrayr-geo-update.timer >/dev/null 2>&1; fi
                     geo_conf_set GEO_AUTO_UPDATE false
                     print_ok "定时更新已关闭"
                 fi
@@ -2528,7 +3378,7 @@ menu_tools() {
         echo ""
         local cmd mark
         echo -e "   ${BOLD}依赖检查${NC}"
-        for cmd in curl wget crontab logrotate python3 tar awk openssl systemctl
+        for cmd in curl wget crontab logrotate python3 tar awk openssl
         do
             if command -v "$cmd" >/dev/null 2>&1; then
                 mark="${GREEN}已安装${NC}"
@@ -2634,10 +3484,19 @@ main_menu() {
                 echo -e "   Xray 内核  : ${GREEN}$(get_core_version)${NC}"
                 echo -e "   仓库最新版 : ${GREEN}$(get_latest_version)${NC}"
                 echo -e "   发布仓库   : ${CYAN}${REPO}${NC}"
-                echo -e "   系统架构   : ${CYAN}$(get_arch)${NC}"
-                if [[ -f /etc/os-release ]]; then
-                    echo -e "   操作系统   : ${CYAN}$(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d \")${NC}"
-                fi
+                echo ""
+                echo -e "   ${BOLD}运行环境${NC}"
+                echo -e "   操作系统   : ${CYAN}$(detect_distro)${NC}"
+                echo -e "   内核版本   : ${CYAN}$(uname -r)${NC}"
+                echo -e "   系统架构   : ${CYAN}$(uname -m)${NC} → 资产 ${GREEN}$(get_arch)${NC} ${DIM}($(arch_desc "$(get_arch)"))${NC}"
+                echo -e "   C 运行库   : ${CYAN}$(detect_libc)${NC}"
+                echo -e "   服务管理   : ${CYAN}$(init_desc)${NC}"
+                detect_pkg_mgr
+                echo -e "   包管理器   : ${CYAN}$(pkg_mgr_desc)${NC}"
+                echo -e "   CPU 核心   : ${CYAN}$(nproc 2>/dev/null || echo 未知)${NC}"
+                local _mem
+                _mem="$(awk '/MemTotal/{printf "%.0fMB", $2/1024}' /proc/meminfo 2>/dev/null)"
+                echo -e "   内存总量   : ${CYAN}${_mem:-未知}${NC}"
                 pause ;;
             0) echo ""; print_info "已退出"; return 0 ;;
             *) print_warn "无效选择"; sleep 1 ;;
